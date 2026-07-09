@@ -79,9 +79,11 @@ export function variantKeyboard(
   if (variantGroup === "syrup") {
     return {
       inline_keyboard: [
+        [{ text: "Без сиропа", callback_data: `var:${slug}:s_none` }],
         [
-          { text: "Без сиропа", callback_data: `var:${slug}:syrup_no` },
-          { text: "С сиропом", callback_data: `var:${slug}:syrup_yes` },
+          { text: "Солёная карамель", callback_data: `var:${slug}:s_caramel` },
+          { text: "Кокос", callback_data: `var:${slug}:s_coconut` },
+          { text: "Ваниль", callback_data: `var:${slug}:s_vanilla` },
         ],
       ],
     };
@@ -89,8 +91,8 @@ export function variantKeyboard(
   return {
     inline_keyboard: [
       [
-        { text: "Зелёный", callback_data: `var:${slug}:tea_green` },
-        { text: "Чёрный", callback_data: `var:${slug}:tea_black` },
+        { text: "🍈 Зелёный с гуавой", callback_data: `var:${slug}:tea_green` },
+        { text: "🍑 Чёрный с абрикосом", callback_data: `var:${slug}:tea_black` },
       ],
     ],
   };
@@ -129,7 +131,7 @@ export function landmarkKeyboard(): InlineKeyboardMarkup {
   return {
     inline_keyboard: [
       [
-        { text: "🚩 У въезда", callback_data: "lm:entry" },
+        { text: "🏁 У въезда", callback_data: "lm:entry" },
         { text: "🚗 Середина", callback_data: "lm:middle" },
       ],
       [

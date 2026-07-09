@@ -450,6 +450,34 @@ export async function returnReserved(items: CartItem[]): Promise<void> {
 }
 
 // ============================================================================
+// processed_updates — дедупликация Telegram webhook ретраев
+// ============================================================================
+
+/**
+ * Вставляет update_id в журнал.
+ * Возвращает true если апдейт новый, false если дубликат (уже обрабатывался).
+ * При ошибке БД: fail-open (возвращает true) чтобы не терять апдейты.
+ */
+export async function insertProcessedUpdate(updateId: number): Promise<boolean> {
+  const { error } = await supabase
+    .from("processed_updates")
+    .insert({ update_id: updateId });
+
+  if (error) {
+    if (error.code === "23505") {
+      return false; // duplicate key — already processed
+    }
+    // DB unavailable — fail-open, process the update anyway
+    console.error("processed_updates_insert_failed", {
+      update_id: updateId,
+      error: error.message,
+    });
+    return true;
+  }
+  return true;
+}
+
+// ============================================================================
 // /стат — дневная сводка (Europe/Moscow)
 // ============================================================================
 

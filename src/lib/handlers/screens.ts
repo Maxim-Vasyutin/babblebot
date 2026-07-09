@@ -87,7 +87,7 @@ export function buildMenu(items: MenuItemRow[], cart: CartItem[]): ScreenPayload
 export function buildVariantPrompt(item: MenuItemRow): ScreenPayload | null {
   if (item.variant_group === "syrup") {
     return {
-      text: `${esc(item.title)} — с сиропом или без? Сироп бесплатно 🙂`,
+      text: `${esc(item.title)} — какой сироп? Сироп бесплатно 🙂`,
       options: { reply_markup: variantKeyboard(item.slug, "syrup") },
     };
   }

@@ -320,6 +320,25 @@ async function handleAdmStatus(
     } catch (err) {
       console.error("return_reserved_failed", { order_id: orderId, err: String(err) });
     }
+    // Notify the client — 403 (bot blocked) is expected and non-fatal
+    try {
+      await sendMessage(
+        order.user_id,
+        `❌ Заказ #${order.order_number} отменён.\n` +
+          `Если это ошибка или передумали — оформите заново: жмите «Меню» 🐾`,
+        {
+          reply_markup: {
+            inline_keyboard: [[{ text: "🧋 Меню", callback_data: "menu" }]],
+          },
+        }
+      );
+    } catch (notifyErr) {
+      console.warn("cancel_notify_failed", {
+        order_id: orderId,
+        user_id: order.user_id,
+        err: String(notifyErr),
+      });
+    }
   }
 
   if (!order.admin_message_id && cb.message?.message_id) {

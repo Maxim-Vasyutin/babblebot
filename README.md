@@ -215,7 +215,29 @@ curl "https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/getWebhookInfo"
 
 ---
 
-### Шаг 7. Привязать рабочий чат
+### Шаг 7. Включить меню команд бота
+
+Это добавит кнопку ☰ рядом с полем ввода в диалоге с ботом — пользователи увидят /start и /menu.
+
+Выполни в терминале, **подставив реальный токен**:
+
+```bash
+curl "https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/setMyCommands" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "commands": [
+      {"command": "start", "description": "🐱 Запустить / сбросить заказ"},
+      {"command": "menu",  "description": "🧋 Показать меню"}
+    ],
+    "scope": {"type": "all_private_chats"}
+  }'
+```
+
+Ожидаемый ответ: `{"ok":true,"result":true}`
+
+---
+
+### Шаг 8. Привязать рабочий чат
 
 1. Открой Telegram и зайди в рабочую группу (из шага 3).
 2. Отправь в группу команду: `/init`
@@ -228,7 +250,7 @@ curl "https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/getWebhookInfo"
 
 ---
 
-### Шаг 8. Смоук-тест — проверить полный сценарий
+### Шаг 9. Смоук-тест — проверить полный сценарий
 
 1. **Клиентский поток:** Напиши боту в **личку** (не в группу): `/start`
    - Должно прийти приветствие с кнопками «🧋 Меню», «🛒 Мой заказ», «ℹ️ О нас».
@@ -254,7 +276,7 @@ curl "https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/getWebhookInfo"
 
 ---
 
-### Шаг 9. QR-код для флаера
+### Шаг 10. QR-код для флаера
 
 1. Зайди на любой генератор QR, например [qr-code-generator.com](https://www.qr-code-generator.com/) или [qr.io](https://qr.io/).
 2. Введи ссылку: `https://t.me/<bot_username>` (например: `https://t.me/bubble_cat_penza_bot`).

@@ -15,6 +15,7 @@
 import { NextRequest } from "next/server";
 import { routeUpdate } from "@/lib/handlers/router";
 import { TgUpdate } from "@/lib/schemas";
+import { insertProcessedUpdate } from "@/lib/supabase/queries";
 
 export const dynamic = "force-dynamic";
 
@@ -56,7 +57,13 @@ export async function POST(req: NextRequest): Promise<Response> {
 
   const update = parsed.data;
 
-  // 4. Отдаём в роутер. Все ошибки внутри — глотаем и логируем, наружу 200.
+  // 4. Дедупликация: Telegram может ретраить тот же update_id при таймауте.
+  const isNew = await insertProcessedUpdate(update.update_id);
+  if (!isNew) {
+    return Response.json({ ok: true });
+  }
+
+  // 5. Отдаём в роутер. Все ошибки внутри — глотаем и логируем, наружу 200.
   try {
     await routeUpdate(update);
   } catch (err) {

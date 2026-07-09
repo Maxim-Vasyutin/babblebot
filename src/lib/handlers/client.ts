@@ -374,7 +374,17 @@ async function handleVariantTap(
     return;
   }
   const variantLabel = variantCodeToLabel(variantCode);
-  if (!variantLabel) return;
+  if (!variantLabel) {
+    // Unknown/old variant code — show toast and re-render the variant picker.
+    await answerCallbackQuery(cbId, "Меню обновилось — выбери снова 🙂");
+    const screen = buildVariantPrompt(item);
+    if (screen) {
+      const newId = await renderScreen(chatId, uiMsgId, screen.text, screen.options);
+      session.ui_message_id = newId;
+      await saveSession(session);
+    }
+    return;
+  }
 
   const { cart, capped } = addToCart(session.cart, item, variantLabel);
   if (capped) {
@@ -394,14 +404,21 @@ async function handleVariantTap(
 
 function variantCodeToLabel(code: string): string | null {
   switch (code) {
-    case "syrup_yes":
-      return "С сиропом";
-    case "syrup_no":
+    // Syrups (v1.1)
+    case "s_none":
       return "Без сиропа";
+    case "s_caramel":
+      return "Солёная карамель";
+    case "s_coconut":
+      return "Кокос";
+    case "s_vanilla":
+      return "Ваниль";
+    // Tea
     case "tea_green":
-      return "Зелёный";
+      return "Зелёный с гуавой";
     case "tea_black":
-      return "Чёрный";
+      return "Чёрный с абрикосом";
+    // Legacy syrup codes — return null to trigger graceful fallback
     default:
       return null;
   }
