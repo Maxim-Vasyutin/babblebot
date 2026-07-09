@@ -1,12 +1,12 @@
 /**
  * Клиентский поток (private chat).
  *
- * Всё состояние диалога — в user_sessions (state / context / cart / last_car).
- * На каждом апдейте: загрузить сессию → выполнить переход → сохранить сессию.
+ * v1.1: единственный UI-экран на клиента. renderScreen редактирует или шлёт новое.
+ * ui_message_id для callback берётся из cb.message (self-recovery при рассинхроне).
+ * Для текстового ввода: deleteOldUi → sendMessage → обновить id.
+ * Для pay:* : deleteOldUi (экран оплаты) → sendOrderConfirmation → ui_message_id = null.
  *
- * Callback_data валидируется Zod-регексом (schemas.ts) до попадания сюда.
- * answerCallbackQuery вызывается в роутере в finally — тут этим не занимаемся,
- * кроме случая, когда нужно показать текстовый toast.
+ * Инвариант: корзина/state пишутся в БД ДО отправки в Telegram.
  */
 
 import type { TgUpdateT, TgCallbackQueryT } from "@/lib/schemas";
@@ -17,7 +17,6 @@ import type {
   PaymentMethod,
   UserSessionRow,
 } from "@/types/database";
-import { esc } from "@/lib/telegram/escape";
 import { answerCallbackQuery, sendMessage } from "@/lib/telegram/api";
 import {
   createOrder,
@@ -44,21 +43,22 @@ import {
   paymentLabel,
 } from "./format";
 import {
-  sendAbout,
-  sendCart,
-  sendCarPromptNew,
-  sendCarPromptRepeat,
+  buildAbout,
+  buildCart,
+  buildCarPromptNew,
+  buildCarPromptRepeat,
+  buildLandmarkPrompt,
+  buildLandmarkTextPrompt,
+  buildMenu,
+  buildPaymentPrompt,
+  buildSoftHint,
+  buildVariantPrompt,
+  buildWelcome,
   sendError,
-  sendLandmarkPrompt,
-  sendLandmarkTextPrompt,
-  sendMenu,
   sendOrderConfirmation,
-  sendPaymentPrompt,
-  sendSoftHint,
-  sendVariantPrompt,
   sendWantAck,
-  sendWelcome,
 } from "./screens";
+import { deleteOldUi, renderScreen } from "./render";
 import { sendOrderCard } from "./admin_card";
 import { updateWaitlistBoard } from "./waitlist";
 
@@ -93,12 +93,16 @@ async function handleMessage(
   const text = msg.text?.trim() ?? "";
 
   if (text === "/start") {
+    const oldUiMsgId = session.ui_message_id;
     session.state = "browsing";
     session.cart = [];
     session.context = {};
     try {
+      await deleteOldUi(chatId, oldUiMsgId);
+      const screen = buildWelcome();
+      const result = await sendMessage(chatId, screen.text, screen.options);
+      session.ui_message_id = result.message_id;
       await saveSession(session);
-      await sendWelcome(chatId);
     } catch (err) {
       console.error("client_start_failed", { user_id: session.user_id, err: String(err) });
       await safeError(chatId);
@@ -108,8 +112,13 @@ async function handleMessage(
 
   if (text === "/menu") {
     try {
+      const oldUiMsgId = session.ui_message_id;
+      await deleteOldUi(chatId, oldUiMsgId);
       const items = await getMenuItems();
-      await sendMenu(chatId, items, session.cart);
+      const screen = buildMenu(items, session.cart);
+      const result = await sendMessage(chatId, screen.text, screen.options);
+      session.ui_message_id = result.message_id;
+      await saveSession(session);
     } catch (err) {
       console.error("client_menu_failed", { user_id: session.user_id, err: String(err) });
       await safeError(chatId);
@@ -148,8 +157,11 @@ async function handleCarInput(
   session.last_car = car;
   session.state = "checkout_payment";
   try {
+    await deleteOldUi(chatId, session.ui_message_id);
+    const screen = buildPaymentPrompt();
+    const result = await sendMessage(chatId, screen.text, screen.options);
+    session.ui_message_id = result.message_id;
     await saveSession(session);
-    await sendPaymentPrompt(chatId);
   } catch (err) {
     console.error("client_car_input_failed", { user_id: session.user_id, err: String(err) });
     await safeError(chatId);
@@ -171,7 +183,13 @@ async function handleLandmarkTextInput(
     await sendMessage(chatId, "Обрезали до 100 символов, остальное не войдёт.");
   }
   session.context = { ...session.context, landmark };
-  await afterLandmarkChosen(chatId, session);
+  try {
+    await deleteOldUi(chatId, session.ui_message_id);
+    await afterLandmarkChosen(chatId, session, null);
+  } catch (err) {
+    console.error("client_landmark_text_failed", { user_id: session.user_id, err: String(err) });
+    await safeError(chatId);
+  }
 }
 
 // ============================================================================
@@ -184,6 +202,9 @@ async function handleCallback(
 ): Promise<void> {
   const chatId = cb.message?.chat.id;
   if (!chatId) return;
+
+  // Берём message_id из callback-сообщения — self-recovery при рассинхроне ui_message_id.
+  const uiMsgId = cb.message?.message_id ?? null;
 
   const raw = cb.data ?? "";
   const parsed = CallbackData.safeParse(raw);
@@ -200,35 +221,48 @@ async function handleCallback(
     switch (action) {
       case "menu": {
         const items = await getMenuItems();
-        await sendMenu(chatId, items, session.cart);
+        const screen = buildMenu(items, session.cart);
+        const newId = await renderScreen(chatId, uiMsgId, screen.text, screen.options);
+        session.ui_message_id = newId;
+        await saveSession(session);
         return;
       }
       case "cart": {
-        await sendCart(chatId, session.cart);
+        const screen = buildCart(session.cart);
+        const newId = await renderScreen(chatId, uiMsgId, screen.text, screen.options);
+        session.ui_message_id = newId;
+        await saveSession(session);
         return;
       }
       case "about": {
-        await sendAbout(chatId);
+        const screen = buildAbout();
+        const newId = await renderScreen(chatId, uiMsgId, screen.text, screen.options);
+        session.ui_message_id = newId;
+        await saveSession(session);
         return;
       }
       case "item": {
-        await handleItemTap(chatId, arg1, session, cb.id);
+        await handleItemTap(chatId, arg1, session, cb.id, uiMsgId);
         return;
       }
       case "var": {
-        await handleVariantTap(chatId, arg1, arg2, session, cb.id);
+        await handleVariantTap(chatId, arg1, arg2, session, cb.id, uiMsgId);
         return;
       }
       case "add": {
-        await handleAddTap(chatId, arg1, session, cb.id);
+        await handleAddTap(chatId, arg1, session, cb.id, uiMsgId);
         return;
       }
       case "inc": {
-        await handleIncDec(chatId, arg1, session, "inc", cb.id);
+        await handleIncDec(chatId, arg1, session, "inc", cb.id, uiMsgId);
         return;
       }
       case "dec": {
-        await handleIncDec(chatId, arg1, session, "dec", cb.id);
+        await handleIncDec(chatId, arg1, session, "dec", cb.id, uiMsgId);
+        return;
+      }
+      case "del": {
+        await handleDel(chatId, arg1, session, cb.id, uiMsgId);
         return;
       }
       case "want": {
@@ -236,23 +270,23 @@ async function handleCallback(
         return;
       }
       case "checkout": {
-        await handleCheckout(chatId, session, cb.id);
+        await handleCheckout(chatId, session, cb.id, uiMsgId);
         return;
       }
       case "lm": {
-        await handleLandmark(chatId, arg1, session);
+        await handleLandmark(chatId, arg1, session, uiMsgId);
         return;
       }
       case "car_same": {
-        await handleCarSame(chatId, session, cb.id);
+        await handleCarSame(chatId, session, cb.id, uiMsgId);
         return;
       }
       case "car_new": {
-        await handleCarNew(chatId, session);
+        await handleCarNew(chatId, session, uiMsgId);
         return;
       }
       case "pay": {
-        await handlePay(chatId, arg1, session, cb);
+        await handlePay(chatId, arg1, session, cb, uiMsgId);
         return;
       }
       case "adm_status":
@@ -288,7 +322,8 @@ async function handleItemTap(
   chatId: number,
   slug: string | undefined,
   session: UserSessionRow,
-  cbId: string
+  cbId: string,
+  uiMsgId: number | null
 ): Promise<void> {
   if (!slug) return;
   const items = await getMenuItems();
@@ -299,10 +334,13 @@ async function handleItemTap(
     return;
   }
   if (item.variant_group) {
+    const screen = buildVariantPrompt(item);
+    if (!screen) return;
     session.state = "choosing_variant";
     session.context = { ...session.context, slug };
+    const newId = await renderScreen(chatId, uiMsgId, screen.text, screen.options);
+    session.ui_message_id = newId;
     await saveSession(session);
-    await sendVariantPrompt(chatId, item);
     return;
   }
   const { cart, capped } = addToCart(session.cart, item, null);
@@ -311,9 +349,12 @@ async function handleItemTap(
     return;
   }
   session.cart = cart;
-  session.state = "cart";
+  session.state = "browsing";
+  await answerCallbackQuery(cbId, `${item.title} добавлен ✅`);
+  const screen = buildMenu(items, session.cart);
+  const newId = await renderScreen(chatId, uiMsgId, screen.text, screen.options);
+  session.ui_message_id = newId;
   await saveSession(session);
-  await sendCart(chatId, session.cart);
 }
 
 async function handleVariantTap(
@@ -321,7 +362,8 @@ async function handleVariantTap(
   slug: string | undefined,
   variantCode: string | undefined,
   session: UserSessionRow,
-  cbId: string
+  cbId: string,
+  uiMsgId: number | null
 ): Promise<void> {
   if (!slug || !variantCode) return;
   const items = await getMenuItems();
@@ -340,10 +382,14 @@ async function handleVariantTap(
     return;
   }
   session.cart = cart;
-  session.state = "cart";
+  session.state = "browsing";
   session.context = {};
+  const toastText = `${item.title} (${variantLabel.toLowerCase()}) добавлен ✅`;
+  await answerCallbackQuery(cbId, toastText);
+  const screen = buildMenu(items, session.cart);
+  const newId = await renderScreen(chatId, uiMsgId, screen.text, screen.options);
+  session.ui_message_id = newId;
   await saveSession(session);
-  await sendCart(chatId, session.cart);
 }
 
 function variantCodeToLabel(code: string): string | null {
@@ -365,7 +411,8 @@ async function handleAddTap(
   chatId: number,
   slug: string | undefined,
   session: UserSessionRow,
-  cbId: string
+  cbId: string,
+  uiMsgId: number | null
 ): Promise<void> {
   if (!slug) return;
   const items = await getMenuItems();
@@ -380,13 +427,16 @@ async function handleAddTap(
     return;
   }
   session.cart = cart;
-  session.state = "cart";
+  session.state = "browsing";
+  await answerCallbackQuery(cbId, `${item.title} добавлен ✅`);
+  const screen = buildMenu(items, session.cart);
+  const newId = await renderScreen(chatId, uiMsgId, screen.text, screen.options);
+  session.ui_message_id = newId;
   await saveSession(session);
-  await sendCart(chatId, session.cart);
 }
 
 // ============================================================================
-// inc/dec
+// inc/dec/del
 // ============================================================================
 
 async function handleIncDec(
@@ -394,7 +444,8 @@ async function handleIncDec(
   idxStr: string | undefined,
   session: UserSessionRow,
   op: "inc" | "dec",
-  cbId: string
+  cbId: string,
+  uiMsgId: number | null
 ): Promise<void> {
   const idx = Number(idxStr);
   if (!Number.isInteger(idx) || idx < 0) return;
@@ -403,7 +454,10 @@ async function handleIncDec(
     op === "inc" ? incCart(session.cart, idx) : decCart(session.cart, idx);
   if (res.notFound) {
     await answerCallbackQuery(cbId, "Корзина изменилась");
-    await sendCart(chatId, session.cart);
+    const screen = buildCart(session.cart);
+    const newId = await renderScreen(chatId, uiMsgId, screen.text, screen.options);
+    session.ui_message_id = newId;
+    await saveSession(session);
     return;
   }
   if (op === "inc" && "capped" in res && res.capped) {
@@ -411,8 +465,36 @@ async function handleIncDec(
     return;
   }
   session.cart = res.cart;
+  const screen = buildCart(session.cart);
+  const newId = await renderScreen(chatId, uiMsgId, screen.text, screen.options);
+  session.ui_message_id = newId;
   await saveSession(session);
-  await sendCart(chatId, session.cart);
+}
+
+async function handleDel(
+  chatId: number,
+  idxStr: string | undefined,
+  session: UserSessionRow,
+  cbId: string,
+  uiMsgId: number | null
+): Promise<void> {
+  if (!idxStr) return;
+  const idx = Number(idxStr);
+  if (!Number.isInteger(idx) || idx < 0 || idx >= session.cart.length) {
+    await answerCallbackQuery(cbId, "Корзина изменилась");
+    const screen = buildCart(session.cart);
+    const newId = await renderScreen(chatId, uiMsgId, screen.text, screen.options);
+    session.ui_message_id = newId;
+    await saveSession(session);
+    return;
+  }
+  const newCart = session.cart.slice();
+  newCart.splice(idx, 1);
+  session.cart = newCart;
+  const screen = buildCart(session.cart);
+  const newId = await renderScreen(chatId, uiMsgId, screen.text, screen.options);
+  session.ui_message_id = newId;
+  await saveSession(session);
 }
 
 // ============================================================================
@@ -454,7 +536,6 @@ async function handleWant(
     }
   }
 
-  // sendWantAck for not_carried (optional nice touch — sends a message with group link)
   if (kind === "not_carried") {
     try {
       await sendWantAck(chatId, title);
@@ -471,7 +552,8 @@ async function handleWant(
 async function handleCheckout(
   chatId: number,
   session: UserSessionRow,
-  cbId: string
+  cbId: string,
+  uiMsgId: number | null
 ): Promise<void> {
   if (session.cart.length === 0) {
     await answerCallbackQuery(cbId, "Корзина пуста");
@@ -481,79 +563,92 @@ async function handleCheckout(
   const { cart, dropped } = filterAvailable(session.cart, items);
   if (dropped.length > 0) {
     session.cart = cart;
+    await answerCallbackQuery(cbId, "Часть позиций закончилась — корзину обновили 🛒");
+    const screen = buildCart(cart);
+    const newId = await renderScreen(chatId, uiMsgId, screen.text, screen.options);
+    session.ui_message_id = newId;
     await saveSession(session);
-    const list = dropped.map((t) => `«${esc(t)}»`).join(", ");
-    await sendMessage(
-      chatId,
-      `Пока вы собирали, ${list} закончилось. Убрали из заказа.`
-    );
-    if (cart.length === 0) {
-      await sendCart(chatId, cart);
-      return;
-    }
+    return;
   }
   session.state = "checkout_landmark";
   session.context = {};
+  const screen = buildLandmarkPrompt();
+  const newId = await renderScreen(chatId, uiMsgId, screen.text, screen.options);
+  session.ui_message_id = newId;
   await saveSession(session);
-  await sendLandmarkPrompt(chatId);
 }
 
 async function handleLandmark(
   chatId: number,
   code: string | undefined,
-  session: UserSessionRow
+  session: UserSessionRow,
+  uiMsgId: number | null
 ): Promise<void> {
   if (!code) return;
   if (code === "text") {
     session.state = "checkout_landmark_text";
+    const screen = buildLandmarkTextPrompt();
+    const newId = await renderScreen(chatId, uiMsgId, screen.text, screen.options);
+    session.ui_message_id = newId;
     await saveSession(session);
-    await sendLandmarkTextPrompt(chatId);
     return;
   }
   if (code !== "entry" && code !== "middle" && code !== "tail") return;
   const landmark = landmarkLabel(code);
   session.context = { ...session.context, landmark };
-  await afterLandmarkChosen(chatId, session);
+  await afterLandmarkChosen(chatId, session, uiMsgId);
 }
 
 async function afterLandmarkChosen(
   chatId: number,
-  session: UserSessionRow
+  session: UserSessionRow,
+  uiMsgId: number | null
 ): Promise<void> {
+  session.state = "checkout_car";
+  let screen;
   if (session.last_car && session.last_car.length > 0) {
-    session.state = "checkout_car";
-    await saveSession(session);
-    await sendCarPromptRepeat(chatId, session.last_car);
+    screen = buildCarPromptRepeat(session.last_car);
   } else {
-    session.state = "checkout_car";
-    await saveSession(session);
-    await sendCarPromptNew(chatId);
+    screen = buildCarPromptNew();
   }
+  const newId = await renderScreen(chatId, uiMsgId, screen.text, screen.options);
+  session.ui_message_id = newId;
+  await saveSession(session);
 }
 
 async function handleCarSame(
   chatId: number,
   session: UserSessionRow,
-  cbId: string
+  cbId: string,
+  uiMsgId: number | null
 ): Promise<void> {
   if (!session.last_car) {
     await answerCallbackQuery(cbId, "Нет прошлой машины, напишите текстом");
-    await sendCarPromptNew(chatId);
+    session.state = "checkout_car";
+    const screen = buildCarPromptNew();
+    const newId = await renderScreen(chatId, uiMsgId, screen.text, screen.options);
+    session.ui_message_id = newId;
+    await saveSession(session);
     return;
   }
   session.context = { ...session.context, car: session.last_car };
   session.state = "checkout_payment";
+  const screen = buildPaymentPrompt();
+  const newId = await renderScreen(chatId, uiMsgId, screen.text, screen.options);
+  session.ui_message_id = newId;
   await saveSession(session);
-  await sendPaymentPrompt(chatId);
 }
 
 async function handleCarNew(
   chatId: number,
-  session: UserSessionRow
+  session: UserSessionRow,
+  uiMsgId: number | null
 ): Promise<void> {
   session.state = "checkout_car";
+  const screen = buildCarPromptNew();
+  const newId = await renderScreen(chatId, uiMsgId, screen.text, screen.options);
+  session.ui_message_id = newId;
   await saveSession(session);
-  await sendCarPromptNew(chatId);
 }
 
 // ============================================================================
@@ -564,7 +659,8 @@ async function handlePay(
   chatId: number,
   method: string | undefined,
   session: UserSessionRow,
-  cb: TgCallbackQueryT
+  cb: TgCallbackQueryT,
+  uiMsgId: number | null
 ): Promise<void> {
   const cbId = cb.id;
   if (session.state !== "checkout_payment") {
@@ -587,6 +683,7 @@ async function handlePay(
     });
     session.state = "browsing";
     session.context = {};
+    session.ui_message_id = null;
     await saveSession(session);
     await sendMessage(chatId, "Что-то потерялось. Начнём заново с меню.");
     return;
@@ -606,45 +703,40 @@ async function handlePay(
     // Some items ran out — correct cart and return to cart screen
     const shortBySlug = new Map(reserveResult.short.map((s) => [s.slug, s.available]));
     const correctedCart: CartItem[] = [];
-    const adjustedTitles: string[] = [];
 
     for (const item of cart) {
       const available = shortBySlug.get(item.slug);
       if (available === undefined) {
-        // Item was fully available
         correctedCart.push(item);
       } else if (available > 0) {
-        // Partially available — trim qty
         correctedCart.push({ ...item, qty: available });
-        adjustedTitles.push(`${esc(item.title)} (осталось ${available} шт)`);
-      } else {
-        // Fully out — remove
-        adjustedTitles.push(`${esc(item.title)} (закончилось)`);
       }
+      // else: fully out — skip
     }
 
     session.cart = correctedCart;
     session.state = "cart";
+    await answerCallbackQuery(cbId, "Часть позиций закончилась — обновили корзину 🛒");
+    const screen = buildCart(correctedCart);
+    const newId = await renderScreen(chatId, uiMsgId, screen.text, screen.options);
+    session.ui_message_id = newId;
     await saveSession(session);
-
-    if (adjustedTitles.length > 0) {
-      await sendMessage(
-        chatId,
-        `Остатков не хватило:\n${adjustedTitles.join("\n")}\nПоправили заказ — проверьте и оформите снова 🙏`
-      );
-    }
-    await sendCart(chatId, correctedCart);
     return;
   }
 
   const totalKop = cartTotalKop(cart);
   const snapshotCart = cart.slice();
 
-  // КРИТИЧНО: сбрасываем state ДО отправки в Telegram (защита от двойного заказа)
+  // КРИТИЧНО: сбрасываем state ДО отправки в Telegram (защита от двойного заказа).
+  // Также сбрасываем ui_message_id — чек не является UI-экраном.
   session.state = "browsing";
   session.cart = [];
   session.context = {};
+  session.ui_message_id = null;
   await saveSession(session);
+
+  // Удалить экран оплаты перед отправкой чека (best-effort).
+  await deleteOldUi(chatId, uiMsgId);
 
   let orderId: string | null = null;
   let orderNumber: number | null = null;
@@ -704,6 +796,7 @@ async function handlePay(
     session.state = "checkout_payment";
     session.cart = snapshotCart;
     session.context = { car, landmark };
+    session.ui_message_id = null;
     try {
       await saveSession(session);
     } catch (saveErr) {
@@ -728,6 +821,19 @@ async function safeError(chatId: number): Promise<void> {
     await sendError(chatId);
   } catch (err) {
     console.error("send_error_failed", { chat_id: chatId, err: String(err) });
+  }
+}
+
+// ============================================================================
+// Мелкие функции для sendSoftHint (вызывается из handleMessage напрямую)
+// ============================================================================
+
+async function sendSoftHint(chatId: number): Promise<void> {
+  try {
+    const screen = buildSoftHint();
+    await sendMessage(chatId, screen.text, screen.options);
+  } catch (err) {
+    console.error("send_soft_hint_failed", { chat_id: chatId, err: String(err) });
   }
 }
 

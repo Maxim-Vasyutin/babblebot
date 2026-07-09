@@ -70,6 +70,7 @@ export type UserSessionRow = {
   context: Record<string, unknown>;
   cart: CartItem[];
   last_car: string | null;
+  ui_message_id: number | null;
   created_at: string;
   updated_at: string;
 };

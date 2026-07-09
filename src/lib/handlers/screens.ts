@@ -1,10 +1,12 @@
 /**
- * «Экраны» бота — отправка сообщений с текстами из SPEC.md, Блок 4.
+ * «Экраны» бота — тексты и клавиатуры из SPEC.md, Блок 4.
  *
- * Тексты — дословно по SPEC.md, менять их без правки спеки нельзя.
+ * build* функции возвращают {text, options} для renderScreen.
+ * send* функции — тонкие обёртки для прямых отправок (чек заказа, ошибки, ack).
  */
 
 import { sendMessage } from "@/lib/telegram/api";
+import type { SendMessageOptions } from "@/lib/telegram/api";
 import {
   aboutKeyboard,
   cartKeyboard,
@@ -28,6 +30,8 @@ import {
   renderCartLines,
 } from "./format";
 
+export type ScreenPayload = { text: string; options: SendMessageOptions };
+
 // ============================================================================
 // URL из env
 // ============================================================================
@@ -40,23 +44,134 @@ function mapUrl(): string {
 }
 
 // ============================================================================
-// Приветствие / О нас / Меню
+// build* — возвращают {text, options} для renderScreen
+// ============================================================================
+
+export function buildWelcome(): ScreenPayload {
+  return {
+    text:
+      "🐱 <b>Bubble Cat</b> приехал к очереди!\n\n" +
+      "Напитки и сэндвичи прямо к вашей машине — не выходя из очереди.\n" +
+      "Соберите заказ, укажите машину, курьер принесёт. Оплата при получении.",
+    options: { reply_markup: mainMenuKeyboard() },
+  };
+}
+
+export function buildAbout(): ScreenPayload {
+  return {
+    text: "Bubble Cat — бабл-ти и сэндвичи 🐱\nМы на карте и в Telegram:",
+    options: {
+      reply_markup: aboutKeyboard(mapUrl(), groupUrl()),
+      disable_web_page_preview: true,
+    },
+  };
+}
+
+export function buildMenu(items: MenuItemRow[], cart: CartItem[]): ScreenPayload {
+  const available = items.filter((i) => i.available && i.stock_qty > 0);
+  const unavailable = items.filter((i) => !i.available || i.stock_qty === 0);
+  const count = cartTotalQty(cart);
+  const totalKop = cartTotalKop(cart);
+
+  const text =
+    available.length === 0 && unavailable.length > 0
+      ? "Сегодня всё разобрали 🙈, но вот что хотят другие:"
+      : "🧋 Что берём? Всё по 500 мл.";
+
+  return {
+    text,
+    options: { reply_markup: menuKeyboard(available, unavailable, count, totalKop) },
+  };
+}
+
+export function buildVariantPrompt(item: MenuItemRow): ScreenPayload | null {
+  if (item.variant_group === "syrup") {
+    return {
+      text: `${esc(item.title)} — с сиропом или без? Сироп бесплатно 🙂`,
+      options: { reply_markup: variantKeyboard(item.slug, "syrup") },
+    };
+  }
+  if (item.variant_group === "tea") {
+    return {
+      text: `${esc(item.title)} — какой?`,
+      options: { reply_markup: variantKeyboard(item.slug, "tea") },
+    };
+  }
+  return null;
+}
+
+export function buildCart(cart: CartItem[]): ScreenPayload {
+  if (cart.length === 0) {
+    return {
+      text: "🛒 Корзина пуста. Загляните в меню!",
+      options: {
+        reply_markup: { inline_keyboard: [[{ text: "🧋 Меню", callback_data: "menu" }]] },
+      },
+    };
+  }
+  const lines = renderCartLines(cart);
+  const total = formatRub(cartTotalKop(cart));
+  return {
+    text: `🛒 <b>Ваш заказ:</b>\n${lines}\n<b>Итого: ${total}</b>`,
+    options: { reply_markup: cartKeyboard(cart) },
+  };
+}
+
+export function buildLandmarkPrompt(): ScreenPayload {
+  return {
+    text: "Шаг 1/3. Где вы стоите в очереди?",
+    options: { reply_markup: landmarkKeyboard() },
+  };
+}
+
+export function buildLandmarkTextPrompt(): ScreenPayload {
+  return { text: "Напишите ориентир одним сообщением.", options: {} };
+}
+
+export function buildCarPromptNew(): ScreenPayload {
+  return {
+    text:
+      "Шаг 2/3. Опишите машину одним сообщением: цвет, марку, номер.\n" +
+      "Например: белая Гранта А123ВС",
+    options: {},
+  };
+}
+
+export function buildCarPromptRepeat(lastCar: string): ScreenPayload {
+  return {
+    text: `Шаг 2/3. Машина та же — ${esc(lastCar)}?`,
+    options: { reply_markup: carKeyboard() },
+  };
+}
+
+export function buildPaymentPrompt(): ScreenPayload {
+  return {
+    text: "Шаг 3/3. Как оплатите курьеру при получении?",
+    options: { reply_markup: paymentKeyboard() },
+  };
+}
+
+export function buildSoftHint(): ScreenPayload {
+  return {
+    text: "Не совсем понял 🐾 Загляните в меню — там всё, что можно заказать.",
+    options: {
+      reply_markup: { inline_keyboard: [[{ text: "🧋 Меню", callback_data: "menu" }]] },
+    },
+  };
+}
+
+// ============================================================================
+// Приветствие / О нас / Меню (send* для обратной совместимости)
 // ============================================================================
 
 export async function sendWelcome(chatId: number): Promise<void> {
-  const text =
-    "🐱 <b>Bubble Cat</b> приехал к очереди!\n\n" +
-    "Напитки и сэндвичи прямо к вашей машине — не выходя из очереди.\n" +
-    "Соберите заказ, укажите машину, курьер принесёт. Оплата при получении.";
-  await sendMessage(chatId, text, { reply_markup: mainMenuKeyboard() });
+  const { text, options } = buildWelcome();
+  await sendMessage(chatId, text, options);
 }
 
 export async function sendAbout(chatId: number): Promise<void> {
-  const text = "Bubble Cat — бабл-ти и сэндвичи 🐱\nМы на карте и в Telegram:";
-  await sendMessage(chatId, text, {
-    reply_markup: aboutKeyboard(mapUrl(), groupUrl()),
-    disable_web_page_preview: true,
-  });
+  const { text, options } = buildAbout();
+  await sendMessage(chatId, text, options);
 }
 
 export async function sendMenu(
@@ -64,21 +179,8 @@ export async function sendMenu(
   items: MenuItemRow[],
   cart: CartItem[]
 ): Promise<void> {
-  // v1.1: доступность = available AND stock_qty > 0
-  const available = items.filter((i) => i.available && i.stock_qty > 0);
-  const unavailable = items.filter((i) => !i.available || i.stock_qty === 0);
-  const count = cartTotalQty(cart);
-
-  let text: string;
-  if (available.length === 0 && unavailable.length > 0) {
-    text = "Сегодня всё разобрали 🙈, но вот что хотят другие:";
-  } else {
-    text = "🧋 Что берём? Всё по 500 мл.";
-  }
-
-  await sendMessage(chatId, text, {
-    reply_markup: menuKeyboard(available, unavailable, count),
-  });
+  const { text, options } = buildMenu(items, cart);
+  await sendMessage(chatId, text, options);
 }
 
 // ============================================================================
@@ -89,20 +191,8 @@ export async function sendVariantPrompt(
   chatId: number,
   item: MenuItemRow
 ): Promise<void> {
-  if (item.variant_group === "syrup") {
-    await sendMessage(
-      chatId,
-      `${esc(item.title)} — с сиропом или без? Сироп бесплатно 🙂`,
-      { reply_markup: variantKeyboard(item.slug, "syrup") }
-    );
-    return;
-  }
-  if (item.variant_group === "tea") {
-    await sendMessage(chatId, `${esc(item.title)} — какой?`, {
-      reply_markup: variantKeyboard(item.slug, "tea"),
-    });
-    return;
-  }
+  const screen = buildVariantPrompt(item);
+  if (screen) await sendMessage(chatId, screen.text, screen.options);
 }
 
 // ============================================================================
@@ -110,18 +200,8 @@ export async function sendVariantPrompt(
 // ============================================================================
 
 export async function sendCart(chatId: number, cart: CartItem[]): Promise<void> {
-  if (cart.length === 0) {
-    await sendMessage(chatId, "🛒 Корзина пуста. Загляните в меню!", {
-      reply_markup: {
-        inline_keyboard: [[{ text: "🧋 Меню", callback_data: "menu" }]],
-      },
-    });
-    return;
-  }
-  const lines = renderCartLines(cart);
-  const total = formatRub(cartTotalKop(cart));
-  const text = `🛒 <b>Ваш заказ:</b>\n${lines}\n<b>Итого: ${total}</b>`;
-  await sendMessage(chatId, text, { reply_markup: cartKeyboard(cart) });
+  const { text, options } = buildCart(cart);
+  await sendMessage(chatId, text, options);
 }
 
 // ============================================================================
@@ -129,36 +209,31 @@ export async function sendCart(chatId: number, cart: CartItem[]): Promise<void> 
 // ============================================================================
 
 export async function sendLandmarkPrompt(chatId: number): Promise<void> {
-  await sendMessage(chatId, "Шаг 1/3. Где вы стоите в очереди?", {
-    reply_markup: landmarkKeyboard(),
-  });
+  const { text, options } = buildLandmarkPrompt();
+  await sendMessage(chatId, text, options);
 }
 
 export async function sendLandmarkTextPrompt(chatId: number): Promise<void> {
-  await sendMessage(chatId, "Напишите ориентир одним сообщением.");
+  const { text, options } = buildLandmarkTextPrompt();
+  await sendMessage(chatId, text, options);
 }
 
 export async function sendCarPromptNew(chatId: number): Promise<void> {
-  await sendMessage(
-    chatId,
-    "Шаг 2/3. Опишите машину одним сообщением: цвет, марку, номер.\n" +
-      "Например: белая Гранта А123ВС"
-  );
+  const { text, options } = buildCarPromptNew();
+  await sendMessage(chatId, text, options);
 }
 
 export async function sendCarPromptRepeat(
   chatId: number,
   lastCar: string
 ): Promise<void> {
-  await sendMessage(chatId, `Шаг 2/3. Машина та же — ${esc(lastCar)}?`, {
-    reply_markup: carKeyboard(),
-  });
+  const { text, options } = buildCarPromptRepeat(lastCar);
+  await sendMessage(chatId, text, options);
 }
 
 export async function sendPaymentPrompt(chatId: number): Promise<void> {
-  await sendMessage(chatId, "Шаг 3/3. Как оплатите курьеру при получении?", {
-    reply_markup: paymentKeyboard(),
-  });
+  const { text, options } = buildPaymentPrompt();
+  await sendMessage(chatId, text, options);
 }
 
 // ============================================================================
@@ -209,15 +284,8 @@ export async function sendWantAck(
 }
 
 export async function sendSoftHint(chatId: number): Promise<void> {
-  await sendMessage(
-    chatId,
-    "Не совсем понял 🐾 Загляните в меню — там всё, что можно заказать.",
-    {
-      reply_markup: {
-        inline_keyboard: [[{ text: "🧋 Меню", callback_data: "menu" }]],
-      },
-    }
-  );
+  const { text, options } = buildSoftHint();
+  await sendMessage(chatId, text, options);
 }
 
 export async function sendError(chatId: number): Promise<void> {

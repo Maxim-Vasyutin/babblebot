@@ -32,7 +32,8 @@ export function mainMenuKeyboard(): InlineKeyboardMarkup {
 export function menuKeyboard(
   available: MenuItemRow[],
   unavailable: MenuItemRow[],
-  cartCount: number
+  cartCount: number,
+  cartKop: number = 0
 ): InlineKeyboardMarkup {
   const rows: InlineKeyboardButton[][] = [];
 
@@ -59,7 +60,9 @@ export function menuKeyboard(
   }
 
   const cartLabel =
-    cartCount > 0 ? `🛒 Мой заказ (${cartCount})` : "🛒 Мой заказ";
+    cartCount > 0
+      ? `🛒 Корзина (${cartCount}) · ${Math.round(cartKop / 100)}₽`
+      : "🛒 Корзина";
   rows.push([{ text: cartLabel, callback_data: "cart" }]);
 
   return { inline_keyboard: rows };
@@ -108,6 +111,7 @@ export function cartKeyboard(cart: CartItem[]): InlineKeyboardMarkup {
       { text: "−", callback_data: `dec:${idx}` },
       { text: label, callback_data: "cart" },
       { text: "+", callback_data: `inc:${idx}` },
+      { text: "✖", callback_data: `del:${idx}` },
     ]);
   });
 
