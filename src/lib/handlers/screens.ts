@@ -1,11 +1,6 @@
 /**
  * «Экраны» бота — отправка сообщений с текстами из SPEC.md, Блок 4.
  *
- * Каждая функция:
- *  1) собирает текст (через esc() для пользовательских полей),
- *  2) выбирает клавиатуру,
- *  3) вызывает sendMessage.
- *
  * Тексты — дословно по SPEC.md, менять их без правки спеки нельзя.
  */
 
@@ -34,7 +29,7 @@ import {
 } from "./format";
 
 // ============================================================================
-// URL из env (для about / confirmation)
+// URL из env
 // ============================================================================
 
 function groupUrl(): string {
@@ -57,8 +52,7 @@ export async function sendWelcome(chatId: number): Promise<void> {
 }
 
 export async function sendAbout(chatId: number): Promise<void> {
-  const text =
-    "Bubble Cat — бабл-ти и сэндвичи 🐱\nМы на карте и в Telegram:";
+  const text = "Bubble Cat — бабл-ти и сэндвичи 🐱\nМы на карте и в Telegram:";
   await sendMessage(chatId, text, {
     reply_markup: aboutKeyboard(mapUrl(), groupUrl()),
     disable_web_page_preview: true,
@@ -70,8 +64,9 @@ export async function sendMenu(
   items: MenuItemRow[],
   cart: CartItem[]
 ): Promise<void> {
-  const available = items.filter((i) => i.available);
-  const unavailable = items.filter((i) => !i.available);
+  // v1.1: доступность = available AND stock_qty > 0
+  const available = items.filter((i) => i.available && i.stock_qty > 0);
+  const unavailable = items.filter((i) => !i.available || i.stock_qty === 0);
   const count = cartTotalQty(cart);
 
   let text: string;
@@ -108,7 +103,6 @@ export async function sendVariantPrompt(
     });
     return;
   }
-  // Не должно случиться (item без variant_group не должен попадать сюда).
 }
 
 // ============================================================================
@@ -198,7 +192,7 @@ export async function sendOrderConfirmation(
 }
 
 // ============================================================================
-// «Хочу 👀»
+// «Хочу 👀» (not_carried — присылает сообщение со ссылкой на группу)
 // ============================================================================
 
 export async function sendWantAck(
@@ -214,7 +208,6 @@ export async function sendWantAck(
   });
 }
 
-/** Общая «мягкая подсказка» на непонятный текст. */
 export async function sendSoftHint(chatId: number): Promise<void> {
   await sendMessage(
     chatId,
@@ -227,17 +220,9 @@ export async function sendSoftHint(chatId: number): Promise<void> {
   );
 }
 
-/** Ошибка «повторите». Не сбрасывает state. */
 export async function sendError(chatId: number): Promise<void> {
-  await sendMessage(
-    chatId,
-    "⚠️ Ой, что-то сломалось. Повторите, пожалуйста."
-  );
+  await sendMessage(chatId, "⚠️ Ой, что-то сломалось. Повторите, пожалуйста.");
 }
 
-// Общее ограничение по ссылкам в тексте подтверждения — превью выключаем.
-// (реэкспорт нужен для admin-модуля)
 export { groupUrl, mapUrl };
-
-// Для admin-модуля пригодятся:
 export { renderBulletLines, paymentLabel };

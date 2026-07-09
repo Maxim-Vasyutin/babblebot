@@ -6,9 +6,7 @@
  *
  * Callback_data валидируется Zod-регексом (schemas.ts) до попадания сюда.
  * answerCallbackQuery вызывается в роутере в finally — тут этим не занимаемся,
- * кроме случая, когда нужно показать текстовый toast (через отдельный параметр).
- *
- * Тексты — SPEC.md, Блок 4. Не переписывать.
+ * кроме случая, когда нужно показать текстовый toast.
  */
 
 import type { TgUpdateT, TgCallbackQueryT } from "@/lib/schemas";
@@ -22,10 +20,13 @@ import type {
 import { esc } from "@/lib/telegram/escape";
 import { answerCallbackQuery, sendMessage } from "@/lib/telegram/api";
 import {
-  bumpDemand,
   createOrder,
   getAdminChatId,
   getMenuItems,
+  recordDemandEvent,
+  releaseReserved,
+  reserveStock,
+  returnReserved,
   saveSession,
   setOrderAdminMessageId,
 } from "@/lib/supabase/queries";
@@ -59,6 +60,7 @@ import {
   sendWelcome,
 } from "./screens";
 import { sendOrderCard } from "./admin_card";
+import { updateWaitlistBoard } from "./waitlist";
 
 // ============================================================================
 // Точка входа
@@ -68,8 +70,6 @@ export async function handleClientUpdate(
   update: TgUpdateT,
   session: UserSessionRow
 ): Promise<void> {
-  // Callback имеет приоритет: приходит вместе с message, но обрабатывается как
-  // взаимодействие с inline-клавиатурой.
   if (update.callback_query) {
     await handleCallback(update.callback_query, session);
     return;
@@ -92,7 +92,6 @@ async function handleMessage(
   const chatId = msg.chat.id;
   const text = msg.text?.trim() ?? "";
 
-  // /start — сброс и приветствие.
   if (text === "/start") {
     session.state = "browsing";
     session.cart = [];
@@ -107,7 +106,6 @@ async function handleMessage(
     return;
   }
 
-  // /menu — синоним кнопки меню.
   if (text === "/menu") {
     try {
       const items = await getMenuItems();
@@ -119,19 +117,16 @@ async function handleMessage(
     return;
   }
 
-  // Ввод машины ожидаем в checkout_car (после car_new или без last_car).
   if (session.state === "checkout_car") {
     await handleCarInput(chatId, text, session);
     return;
   }
 
-  // Ввод ориентира словами.
   if (session.state === "checkout_landmark_text") {
     await handleLandmarkTextInput(chatId, text, session);
     return;
   }
 
-  // Всё остальное — мягкая подсказка.
   await sendSoftHint(chatId);
 }
 
@@ -176,7 +171,6 @@ async function handleLandmarkTextInput(
     await sendMessage(chatId, "Обрезали до 100 символов, остальное не войдёт.");
   }
   session.context = { ...session.context, landmark };
-  // Дальше — либо car_same, либо ввод машины.
   await afterLandmarkChosen(chatId, session);
 }
 
@@ -189,16 +183,18 @@ async function handleCallback(
   session: UserSessionRow
 ): Promise<void> {
   const chatId = cb.message?.chat.id;
-  if (!chatId) return; // без чата ничего не сделаем
+  if (!chatId) return;
 
   const raw = cb.data ?? "";
   const parsed = CallbackData.safeParse(raw);
   if (!parsed.success) {
-    // Мусорный callback — игнор (роутер сам погасит «часики»).
     console.warn("client_callback_invalid", { data: raw });
     return;
   }
-  const [action, arg1, arg2] = raw.split(":");
+  const parts = raw.split(":");
+  const action = parts[0];
+  const arg1 = parts[1];
+  const arg2 = parts[2];
 
   try {
     switch (action) {
@@ -216,15 +212,15 @@ async function handleCallback(
         return;
       }
       case "item": {
-        await handleItemTap(chatId, arg1, session);
+        await handleItemTap(chatId, arg1, session, cb.id);
         return;
       }
       case "var": {
-        await handleVariantTap(chatId, arg1, arg2, session);
+        await handleVariantTap(chatId, arg1, arg2, session, cb.id);
         return;
       }
       case "add": {
-        await handleAddTap(chatId, arg1, session);
+        await handleAddTap(chatId, arg1, session, cb.id);
         return;
       }
       case "inc": {
@@ -236,7 +232,7 @@ async function handleCallback(
         return;
       }
       case "want": {
-        await handleWant(chatId, arg1);
+        await handleWant(chatId, arg1, cb.id, cb.from.id);
         return;
       }
       case "checkout": {
@@ -260,8 +256,11 @@ async function handleCallback(
         return;
       }
       case "adm_status":
-      case "adm_stop": {
-        // Из приватного чата admin-кнопки игнорируем (защита от подмены, #13).
+      case "adm_stop":
+      case "adm_panel":
+      case "adm_stk":
+      case "adm_avail": {
+        // Admin callbacks из приватного чата — игнор (#13).
         return;
       }
       default:
@@ -281,18 +280,22 @@ async function handleCallback(
 // Меню / выбор позиции
 // ============================================================================
 
+function isAvailable(item: MenuItemRow): boolean {
+  return item.available && item.stock_qty > 0;
+}
+
 async function handleItemTap(
   chatId: number,
   slug: string | undefined,
-  session: UserSessionRow
+  session: UserSessionRow,
+  cbId: string
 ): Promise<void> {
   if (!slug) return;
   const items = await getMenuItems();
   const item = items.find((i) => i.slug === slug);
   if (!item) return;
-  if (!item.available) {
-    // Позицию сняли, пока клиент листал — сообщаем toast заменой сообщения.
-    await sendMessage(chatId, "Уже разобрали 🙈");
+  if (!isAvailable(item)) {
+    await answerCallbackQuery(cbId, "Уже разобрали 🙈");
     return;
   }
   if (item.variant_group) {
@@ -302,10 +305,9 @@ async function handleItemTap(
     await sendVariantPrompt(chatId, item);
     return;
   }
-  // Без вариантов — сразу добавляем.
   const { cart, capped } = addToCart(session.cart, item, null);
   if (capped) {
-    await sendMessage(chatId, "Больше 20 не принимаем 🙂");
+    await answerCallbackQuery(cbId, "Больше 20 не принимаем 🙂");
     return;
   }
   session.cart = cart;
@@ -318,14 +320,15 @@ async function handleVariantTap(
   chatId: number,
   slug: string | undefined,
   variantCode: string | undefined,
-  session: UserSessionRow
+  session: UserSessionRow,
+  cbId: string
 ): Promise<void> {
   if (!slug || !variantCode) return;
   const items = await getMenuItems();
   const item = items.find((i) => i.slug === slug);
   if (!item) return;
-  if (!item.available) {
-    await sendMessage(chatId, "Уже разобрали 🙈");
+  if (!isAvailable(item)) {
+    await answerCallbackQuery(cbId, "Уже разобрали 🙈");
     return;
   }
   const variantLabel = variantCodeToLabel(variantCode);
@@ -333,7 +336,7 @@ async function handleVariantTap(
 
   const { cart, capped } = addToCart(session.cart, item, variantLabel);
   if (capped) {
-    await sendMessage(chatId, "Больше 20 не принимаем 🙂");
+    await answerCallbackQuery(cbId, "Больше 20 не принимаем 🙂");
     return;
   }
   session.cart = cart;
@@ -361,18 +364,19 @@ function variantCodeToLabel(code: string): string | null {
 async function handleAddTap(
   chatId: number,
   slug: string | undefined,
-  session: UserSessionRow
+  session: UserSessionRow,
+  cbId: string
 ): Promise<void> {
   if (!slug) return;
   const items = await getMenuItems();
   const item = items.find((i) => i.slug === slug);
-  if (!item || !item.available) {
-    await sendMessage(chatId, "Уже разобрали 🙈");
+  if (!item || !isAvailable(item)) {
+    await answerCallbackQuery(cbId, "Уже разобрали 🙈");
     return;
   }
   const { cart, capped } = addToCart(session.cart, item, null);
   if (capped) {
-    await sendMessage(chatId, "Больше 20 не принимаем 🙂");
+    await answerCallbackQuery(cbId, "Больше 20 не принимаем 🙂");
     return;
   }
   session.cart = cart;
@@ -398,7 +402,6 @@ async function handleIncDec(
   const res =
     op === "inc" ? incCart(session.cart, idx) : decCart(session.cart, idx);
   if (res.notFound) {
-    // Старый callback из прошлого сообщения (edge case #7).
     await answerCallbackQuery(cbId, "Корзина изменилась");
     await sendCart(chatId, session.cart);
     return;
@@ -416,13 +419,49 @@ async function handleIncDec(
 // «Хочу 👀»
 // ============================================================================
 
-async function handleWant(chatId: number, slug: string | undefined): Promise<void> {
+async function handleWant(
+  chatId: number,
+  slug: string | undefined,
+  cbId: string,
+  fromUserId: number
+): Promise<void> {
   if (!slug) return;
   const items = await getMenuItems();
   const item = items.find((i) => i.slug === slug);
   const title = item?.title ?? slug;
-  await bumpDemand(slug, title);
-  await sendWantAck(chatId, title);
+  const kind = item?.field_item ? "sold_out" : "not_carried";
+
+  await recordDemandEvent(slug, title, kind, fromUserId);
+
+  const toastText =
+    kind === "sold_out"
+      ? "Уже разобрали 🙈 Записали, что ждёте"
+      : "Записали! 🐾 Наберётся спрос — привезём";
+  await answerCallbackQuery(cbId, toastText);
+
+  if (kind === "sold_out") {
+    try {
+      const adminChatId = await getAdminChatId();
+      if (adminChatId !== null) {
+        await updateWaitlistBoard(Number(adminChatId));
+      }
+    } catch (err) {
+      console.error("waitlist_board_update_failed", {
+        slug,
+        chat_id: chatId,
+        err: String(err),
+      });
+    }
+  }
+
+  // sendWantAck for not_carried (optional nice touch — sends a message with group link)
+  if (kind === "not_carried") {
+    try {
+      await sendWantAck(chatId, title);
+    } catch {
+      // Non-critical
+    }
+  }
 }
 
 // ============================================================================
@@ -438,7 +477,6 @@ async function handleCheckout(
     await answerCallbackQuery(cbId, "Корзина пуста");
     return;
   }
-  // Перепроверка наличия (edge case #5).
   const items = await getMenuItems();
   const { cart, dropped } = filterAvailable(session.cart, items);
   if (dropped.length > 0) {
@@ -519,7 +557,7 @@ async function handleCarNew(
 }
 
 // ============================================================================
-// Оплата → создание заказа (защита от двойного заказа, edge case #12)
+// Оплата → резервация → создание заказа
 // ============================================================================
 
 async function handlePay(
@@ -529,7 +567,6 @@ async function handlePay(
   cb: TgCallbackQueryT
 ): Promise<void> {
   const cbId = cb.id;
-  // Защита от двойного заказа: обрабатываем только если state == checkout_payment.
   if (session.state !== "checkout_payment") {
     await answerCallbackQuery(cbId, "Заказ уже оформлен");
     return;
@@ -542,7 +579,6 @@ async function handlePay(
   const cart: CartItem[] = session.cart;
 
   if (!car || !landmark || cart.length === 0) {
-    // Что-то потерялось (напр. сессия в невалидном виде) — на безопасный путь.
     console.warn("client_pay_missing_context", {
       user_id: session.user_id,
       has_car: !!car,
@@ -556,19 +592,62 @@ async function handlePay(
     return;
   }
 
-  const totalKop = cartTotalKop(cart);
+  // 1. Reserve stock atomically before creating the order
+  let reserveResult;
+  try {
+    reserveResult = await reserveStock(cart);
+  } catch (err) {
+    console.error("reserve_stock_failed", { user_id: session.user_id, err: String(err) });
+    await safeError(chatId);
+    return;
+  }
 
-  // КРИТИЧНО: переводим state в browsing и сохраняем ДО отправки в Telegram.
-  // Если Telegram-апдейт ретраится или клиент дабл-кликнул — повторный pay:*
-  // придёт в state=browsing и уйдёт в «Заказ уже оформлен».
+  if (!reserveResult.ok) {
+    // Some items ran out — correct cart and return to cart screen
+    const shortBySlug = new Map(reserveResult.short.map((s) => [s.slug, s.available]));
+    const correctedCart: CartItem[] = [];
+    const adjustedTitles: string[] = [];
+
+    for (const item of cart) {
+      const available = shortBySlug.get(item.slug);
+      if (available === undefined) {
+        // Item was fully available
+        correctedCart.push(item);
+      } else if (available > 0) {
+        // Partially available — trim qty
+        correctedCart.push({ ...item, qty: available });
+        adjustedTitles.push(`${esc(item.title)} (осталось ${available} шт)`);
+      } else {
+        // Fully out — remove
+        adjustedTitles.push(`${esc(item.title)} (закончилось)`);
+      }
+    }
+
+    session.cart = correctedCart;
+    session.state = "cart";
+    await saveSession(session);
+
+    if (adjustedTitles.length > 0) {
+      await sendMessage(
+        chatId,
+        `Остатков не хватило:\n${adjustedTitles.join("\n")}\nПоправили заказ — проверьте и оформите снова 🙏`
+      );
+    }
+    await sendCart(chatId, correctedCart);
+    return;
+  }
+
+  const totalKop = cartTotalKop(cart);
   const snapshotCart = cart.slice();
+
+  // КРИТИЧНО: сбрасываем state ДО отправки в Telegram (защита от двойного заказа)
   session.state = "browsing";
   session.cart = [];
   session.context = {};
   await saveSession(session);
 
-  let orderNumber: number | null = null;
   let orderId: string | null = null;
+  let orderNumber: number | null = null;
   try {
     const order = await createOrder({
       user_id: session.user_id,
@@ -579,11 +658,9 @@ async function handlePay(
       car,
       payment_method: paymentMethod,
     });
-    orderNumber = order.order_number;
     orderId = order.id;
+    orderNumber = order.order_number;
 
-    // Отправить карточку в admin-чат (не критично — если чат не привязан,
-    // заказ сохранён, клиенту всё равно подтверждаем).
     try {
       const adminChatId = await getAdminChatId();
       if (adminChatId !== null) {
@@ -601,7 +678,6 @@ async function handlePay(
       });
     }
 
-    // Подтверждение клиенту.
     await sendOrderConfirmation(chatId, {
       orderNumber,
       cart: snapshotCart,
@@ -615,8 +691,16 @@ async function handlePay(
       user_id: session.user_id,
       err: String(err),
     });
-    // Заказ не создан — вернуть корзину клиенту и state=checkout_payment,
-    // чтобы он мог повторить.
+    // Order was NOT created — return reserved stock
+    try {
+      await returnReserved(snapshotCart);
+    } catch (retErr) {
+      console.error("return_reserved_on_rollback_failed", {
+        user_id: session.user_id,
+        err: String(retErr),
+      });
+    }
+    // Restore session
     session.state = "checkout_payment";
     session.cart = snapshotCart;
     session.context = { car, landmark };
@@ -631,12 +715,12 @@ async function handlePay(
     await safeError(chatId);
   }
 
-  // Заглушим неиспользуемое предупреждение — paymentLabel мы не зовём здесь напрямую.
   void paymentLabel;
+  void releaseReserved;
 }
 
 // ============================================================================
-// Утилита: безопасный вызов sendError (не бросит наружу)
+// Утилита: безопасный вызов sendError
 // ============================================================================
 
 async function safeError(chatId: number): Promise<void> {
@@ -647,8 +731,5 @@ async function safeError(chatId: number): Promise<void> {
   }
 }
 
-// Реэкспорт для тестов, если понадобится.
 export { MAX_QTY };
-
-// Отсылка к типу MenuItemRow чтобы линтер не ругался при dev-переработке.
 void (0 as unknown as MenuItemRow);

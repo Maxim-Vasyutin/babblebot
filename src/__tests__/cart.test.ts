@@ -20,6 +20,8 @@ function makeItem(overrides: Partial<MenuItemRow> = {}): MenuItemRow {
     field_item: true,
     available: true,
     sort_order: 10,
+    stock_qty: 10,
+    reserved_qty: 0,
     created_at: "",
     updated_at: "",
     ...overrides,

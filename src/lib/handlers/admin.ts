@@ -2,47 +2,46 @@
  * Admin-поток (сообщения/callback из рабочей группы с chat.id == admin_chat_id).
  *
  * Команды:
- *   /init  — привязать текущий чат как admin_chat_id.
- *            Сохраняем `admin_bound_by` = from.id первого /init.
- *            Повторный /init из другого чата с другим from.id → «Чат уже привязан»
- *            (SPEC.md, Блок 6 #17).
- *   /стоп  — клавиатура наличия позиций (adm_stop:<slug>).
- *   /стат  — дневная сводка (Europe/Moscow).
+ *   /init   — привязать текущий чат как admin_chat_id.
+ *   /панель — панель управления (остатки, статистика).
+ *   /стоп   — алиас /панель, открывает сразу редактор остатков.
+ *   /стат   — дневная сводка (Europe/Moscow).
  *
  * Callback:
- *   adm_stop:<slug>                    — переключить наличие
- *   adm_status:<order_uuid>:<status>   — сменить статус заказа
+ *   adm_panel:<section>              — навигация панели
+ *   adm_stk:<slug>:<inc|dec>         — изменить остаток
+ *   adm_avail:<slug>                 — toggle доступности (ручной стоп/старт)
+ *   adm_stop:<slug>                  — backward compat, алиас adm_avail
+ *   adm_status:<order_uuid>:<status> — сменить статус заказа
  */
 
 import type { TgUpdateT, TgCallbackQueryT, TgMessageT } from "@/lib/schemas";
 import { CallbackData } from "@/lib/schemas";
-import {
-  editMessageText,
-  sendMessage,
-} from "@/lib/telegram/api";
+import { answerCallbackQuery, sendMessage } from "@/lib/telegram/api";
 import { supabase } from "@/lib/supabase/client";
 import {
   getDailyStats,
-  getMenuItems,
   getOrderById,
+  releaseReserved,
+  returnReserved,
   setAdminChatId,
-  toggleAvailability,
-  updateOrderStatus,
+  updateOrderStatusGuarded,
 } from "@/lib/supabase/queries";
 import type { OrderStatus, PaymentMethod } from "@/types/database";
-import { stopKeyboard } from "@/lib/telegram/keyboards";
 import { formatRub } from "./format";
 import { editOrderCard } from "./admin_card";
+import {
+  handleAdmAvailCb,
+  handleAdmPanelCb,
+  handleAdmStkCb,
+  openAdminPanel,
+  openStockEditor,
+} from "./adminPanel";
 
 // ============================================================================
 // Точка входа
 // ============================================================================
 
-/**
- * @param update — валидированный Update.
- * @param adminChatId — актуальный admin_chat_id из БД (null, если не привязан).
- *                     /init разрешён даже при null (это первичная привязка).
- */
 export async function handleAdminUpdate(
   update: TgUpdateT,
   adminChatId: bigint | null
@@ -68,20 +67,32 @@ async function handleAdminMessage(
   const text = (msg.text ?? "").trim();
   if (!text) return;
 
-  // /init — единственная команда, работающая из ЛЮБОЙ группы.
   if (text === "/init") {
     await handleInit(msg, adminChatId);
     return;
   }
 
-  // Прочие admin-команды — только из уже привязанного чата.
   if (adminChatId === null || BigInt(chatId) !== adminChatId) {
-    // Из чужой группы — молча игнор (чтобы не оставлять следов бота).
+    return;
+  }
+
+  if (text === "/панель") {
+    try {
+      await openAdminPanel(chatId);
+    } catch (err) {
+      console.error("admin_panel_failed", { err: String(err) });
+      try { await sendMessage(chatId, "⚠️ Не удалось открыть панель."); } catch { /* ignore */ }
+    }
     return;
   }
 
   if (text === "/стоп" || text === "/stop") {
-    await handleStop(chatId);
+    try {
+      await openStockEditor(chatId);
+    } catch (err) {
+      console.error("admin_stop_failed", { err: String(err) });
+      try { await sendMessage(chatId, "⚠️ Не удалось загрузить остатки."); } catch { /* ignore */ }
+    }
     return;
   }
 
@@ -104,7 +115,6 @@ async function handleInit(
   if (!fromId) return;
 
   try {
-    // Прочитать текущего binder'а (может отсутствовать).
     const { data: bindRow } = await supabase
       .from("app_settings")
       .select("value")
@@ -112,22 +122,17 @@ async function handleInit(
       .maybeSingle();
     const boundBy = bindRow?.value ? Number(bindRow.value) : null;
 
-    // Если чат уже привязан ИМЕННО этот — просто переподтверждаем.
     if (adminChatId !== null && BigInt(chatId) === adminChatId) {
       await sendMessage(chatId, "✅ Этот чат уже рабочий.");
       return;
     }
 
-    // Если привязан другой чат и первичный binder существует и это не он —
-    // отказываем.
     if (adminChatId !== null && boundBy !== null && boundBy !== fromId) {
       await sendMessage(chatId, "Чат уже привязан.");
       return;
     }
 
-    // Разрешено: перепривязываем.
     await setAdminChatId(chatId);
-    // Первый /init фиксирует admin_bound_by (или обновляет, если binder тот же).
     await supabase.from("app_settings").upsert(
       { key: "admin_bound_by", value: String(fromId) },
       { onConflict: "key" }
@@ -135,58 +140,45 @@ async function handleInit(
     await sendMessage(chatId, "✅ Этот чат — рабочий.");
   } catch (err) {
     console.error("admin_init_failed", { chat_id: chatId, err: String(err) });
-    try {
-      await sendMessage(chatId, "⚠️ Не удалось привязать чат. Повторите.");
-    } catch {
-      /* ignore */
-    }
+    try { await sendMessage(chatId, "⚠️ Не удалось привязать чат. Повторите."); } catch { /* ignore */ }
   }
 }
 
 // ============================================================================
-// /стоп: наличие
-// ============================================================================
-
-async function handleStop(chatId: number): Promise<void> {
-  try {
-    const items = await getMenuItems();
-    await sendMessage(chatId, "Наличие позиций (тап — переключить):", {
-      reply_markup: stopKeyboard(items),
-    });
-  } catch (err) {
-    console.error("admin_stop_failed", { err: String(err) });
-    try {
-      await sendMessage(chatId, "⚠️ Не удалось загрузить позиции.");
-    } catch {
-      /* ignore */
-    }
-  }
-}
-
-// ============================================================================
-// /стат: сводка дня
+// /стат: дневная сводка
 // ============================================================================
 
 async function handleStat(chatId: number): Promise<void> {
   try {
     const stats = await getDailyStats();
-    if (stats.count === 0 && stats.top_demand.length === 0) {
+    const date = moscowDate();
+
+    if (
+      stats.count === 0 &&
+      stats.waited_sold_out.length === 0 &&
+      stats.wanted_not_carried.length === 0
+    ) {
       await sendMessage(chatId, "Сегодня пока пусто.");
       return;
     }
-    const date = moscowDate();
-    const lines: string[] = [];
-    lines.push(`📊 <b>Сегодня (${date}):</b>`);
-    lines.push(
-      `Заказов: ${stats.count} · Выручка: ${formatRub(stats.total_kop)}`
-    );
+
+    const lines: string[] = [`📊 <b>Сегодня (${date}):</b>`];
+    lines.push(`Заказов: ${stats.count} · Выручка: ${formatRub(stats.total_kop)}`);
+
     const p = stats.by_payment;
-    const paymentPieces: string[] = [];
-    if (p.cash > 0) paymentPieces.push(`💵 нал: ${formatRub(p.cash)}`);
-    if (p.sbp > 0) paymentPieces.push(`📱 СБП: ${formatRub(p.sbp)}`);
-    if (p.terminal > 0)
-      paymentPieces.push(`💳 терминал: ${formatRub(p.terminal)}`);
-    if (paymentPieces.length > 0) lines.push(paymentPieces.join(" · "));
+    const pp: string[] = [];
+    if (p.cash > 0) pp.push(`💵 нал: ${formatRub(p.cash)}`);
+    if (p.sbp > 0) pp.push(`📱 СБП: ${formatRub(p.sbp)}`);
+    if (p.terminal > 0) pp.push(`💳 терминал: ${formatRub(p.terminal)}`);
+    if (pp.length > 0) lines.push(pp.join(" · "));
+
+    if (stats.stock.length > 0) {
+      lines.push("");
+      lines.push(
+        "📦 <b>Остатки:</b> " +
+          stats.stock.map((it) => `${it.title} — ${it.stock_qty}`).join(" · ")
+      );
+    }
 
     if (stats.top_items.length > 0) {
       lines.push("");
@@ -199,49 +191,43 @@ async function handleStat(chatId: number): Promise<void> {
       );
     }
 
-    if (stats.top_demand.length > 0) {
+    if (stats.waited_sold_out.length > 0) {
       lines.push("");
-      lines.push("👀 <b>Хотели (нет в наличии):</b>");
+      lines.push("⏳ <b>Ждали (кончилось):</b>");
       lines.push(
-        stats.top_demand
+        stats.waited_sold_out
           .slice(0, 5)
-          .map((it) => `${it.title} — ${it.clicks}`)
+          .map((it) => `${it.title} — ${it.count}`)
+          .join(" · ")
+      );
+    }
+
+    if (stats.wanted_not_carried.length > 0) {
+      lines.push("");
+      lines.push("👀 <b>Хотели (не возим):</b>");
+      lines.push(
+        stats.wanted_not_carried
+          .slice(0, 5)
+          .map((it) => `${it.title} — ${it.count}`)
           .join(" · ")
       );
     }
 
     await sendMessage(chatId, lines.join("\n"));
-    // Успокоить линтер по неиспользуемому PaymentMethod-импорту (типовая ссылка).
     void (0 as unknown as PaymentMethod);
   } catch (err) {
     console.error("admin_stat_failed", { err: String(err) });
-    try {
-      await sendMessage(chatId, "⚠️ Не удалось собрать сводку.");
-    } catch {
-      /* ignore */
-    }
+    try { await sendMessage(chatId, "⚠️ Не удалось собрать сводку."); } catch { /* ignore */ }
   }
 }
 
 function moscowDate(): string {
   const msk = new Date(Date.now() + 3 * 60 * 60 * 1000);
-  const d = msk.getUTCDate();
-  const m = msk.getUTCMonth();
   const months = [
-    "января",
-    "февраля",
-    "марта",
-    "апреля",
-    "мая",
-    "июня",
-    "июля",
-    "августа",
-    "сентября",
-    "октября",
-    "ноября",
-    "декабря",
+    "января", "февраля", "марта", "апреля", "мая", "июня",
+    "июля", "августа", "сентября", "октября", "ноября", "декабря",
   ];
-  return `${d} ${months[m]}`;
+  return `${msk.getUTCDate()} ${months[msk.getUTCMonth()]}`;
 }
 
 // ============================================================================
@@ -255,7 +241,6 @@ async function handleAdminCallback(
   const chatId = cb.message?.chat.id;
   if (!chatId) return;
 
-  // Все admin-callback'и допускаются ТОЛЬКО из привязанного admin-чата.
   if (adminChatId === null || BigInt(chatId) !== adminChatId) {
     return;
   }
@@ -263,38 +248,33 @@ async function handleAdminCallback(
   const raw = cb.data ?? "";
   const parsed = CallbackData.safeParse(raw);
   if (!parsed.success) return;
-  const [action, arg1, arg2] = raw.split(":");
+  const parts = raw.split(":");
+  const action = parts[0];
+  const arg1 = parts[1];
+  const arg2 = parts[2];
 
   try {
-    if (action === "adm_stop") {
-      await handleAdmStop(chatId, cb, arg1);
-      return;
-    }
-    if (action === "adm_status") {
-      await handleAdmStatus(chatId, cb, arg1, arg2);
-      return;
+    switch (action) {
+      case "adm_panel":
+        await handleAdmPanelCb(chatId, cb, arg1);
+        return;
+      case "adm_stk":
+        await handleAdmStkCb(chatId, cb, arg1, arg2);
+        return;
+      case "adm_avail":
+        await handleAdmAvailCb(chatId, cb, arg1);
+        return;
+      case "adm_stop":
+        // Backward compat: old messages still have adm_stop: buttons
+        await handleAdmAvailCb(chatId, cb, arg1);
+        return;
+      case "adm_status":
+        await handleAdmStatus(chatId, cb, arg1, arg2);
+        return;
     }
   } catch (err) {
     console.error("admin_callback_failed", { action, err: String(err) });
   }
-}
-
-async function handleAdmStop(
-  chatId: number,
-  cb: TgCallbackQueryT,
-  slug: string | undefined
-): Promise<void> {
-  if (!slug) return;
-  await toggleAvailability(slug);
-  const items = await getMenuItems();
-  const msgId = cb.message?.message_id;
-  if (!msgId) return;
-  await editMessageText(
-    chatId,
-    msgId,
-    "Наличие позиций (тап — переключить):",
-    { reply_markup: stopKeyboard(items) }
-  );
 }
 
 async function handleAdmStatus(
@@ -311,13 +291,39 @@ async function handleAdmStatus(
   ) {
     return;
   }
-  const handler = cb.from.username ?? null;
-  await updateOrderStatus(orderId, status as OrderStatus, handler ?? undefined);
-  const updated = await getOrderById(orderId);
-  if (!updated) return;
-  // Убеждаемся, что admin_message_id есть (карточка редактируется на месте).
-  if (!updated.admin_message_id && cb.message?.message_id) {
-    updated.admin_message_id = cb.message.message_id;
+
+  const handler = cb.from.username ?? undefined;
+  const { updated } = await updateOrderStatusGuarded(
+    orderId,
+    status as OrderStatus,
+    handler
+  );
+
+  if (!updated) {
+    await answerCallbackQuery(cb.id, "Заказ уже обработан");
+    return;
   }
-  await editOrderCard(chatId, updated);
+
+  const order = await getOrderById(orderId);
+  if (!order) return;
+
+  // Release or return reserved stock
+  if (status === "delivered") {
+    try {
+      await releaseReserved(order.items);
+    } catch (err) {
+      console.error("release_reserved_failed", { order_id: orderId, err: String(err) });
+    }
+  } else if (status === "cancelled") {
+    try {
+      await returnReserved(order.items);
+    } catch (err) {
+      console.error("return_reserved_failed", { order_id: orderId, err: String(err) });
+    }
+  }
+
+  if (!order.admin_message_id && cb.message?.message_id) {
+    order.admin_message_id = cb.message.message_id;
+  }
+  await editOrderCard(chatId, order);
 }

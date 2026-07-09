@@ -4,8 +4,6 @@
  * Все callback_data подчиняются регексу из schemas.ts:
  *   ^[a-z_]+(:[a-zA-Z0-9_\-]+){0,2}$
  * Лимит Telegram — 64 байта. Slug'и позиций короткие (см. миграцию).
- *
- * Тексты кнопок и структура — по SPEC.md, Блок 4 (Диалоговые сценарии).
  */
 
 import type { CartItem, MenuItemRow, OrderStatus } from "@/types/database";
@@ -31,13 +29,6 @@ export function mainMenuKeyboard(): InlineKeyboardMarkup {
 // Меню
 // ============================================================================
 
-/**
- * Меню: секция «в наличии» + секция «сегодня нет 👀» + кнопка корзины.
- * @param available   позиции с available=true (field_item тоже true, отфильтровано выше)
- * @param unavailable позиции с available=false (тоже field_item=true в MVP; при желании
- *                    можно докидывать любые slug'и «сегодня нет»)
- * @param cartCount   сумма qty в корзине — для подписи «🛒 Мой заказ (N)»
- */
 export function menuKeyboard(
   available: MenuItemRow[],
   unavailable: MenuItemRow[],
@@ -56,8 +47,6 @@ export function menuKeyboard(
   }
 
   if (unavailable.length > 0) {
-    // Заголовок-разделитель как кнопка-пустышка: Telegram требует callback_data,
-    // поэтому кладём `menu` — тап просто перерендерит меню, не портит UX.
     rows.push([{ text: "👀 Сегодня нет — жми, если хотел бы:", callback_data: "menu" }]);
     for (const item of unavailable) {
       rows.push([
@@ -94,7 +83,6 @@ export function variantKeyboard(
       ],
     };
   }
-  // tea
   return {
     inline_keyboard: [
       [
@@ -109,22 +97,15 @@ export function variantKeyboard(
 // Корзина
 // ============================================================================
 
-/**
- * Клавиатура корзины: на каждую строку ряд [−][title ×qty][+], затем
- * [✅ Оформить] и [➕ Добавить ещё].
- */
 export function cartKeyboard(cart: CartItem[]): InlineKeyboardMarkup {
   const rows: InlineKeyboardButton[][] = [];
 
   cart.forEach((item, idx) => {
-    // Название с вариантом, чтобы отличать «латте с сиропом» от «без».
     const label = item.variant
       ? `${item.title} (${item.variant.toLowerCase()}) ×${item.qty}`
       : `${item.title} ×${item.qty}`;
     rows.push([
       { text: "−", callback_data: `dec:${idx}` },
-      // Центральная «кнопка» — визуальный ярлык. Тап на неё безопасен: показываем
-      // ту же корзину (callback_data:cart).
       { text: label, callback_data: "cart" },
       { text: "+", callback_data: `inc:${idx}` },
     ]);
@@ -159,11 +140,6 @@ export function landmarkKeyboard(): InlineKeyboardMarkup {
 // Машина
 // ============================================================================
 
-/**
- * Клавиатура быстрого повтора машины. Показываем только если last_car есть.
- * Сам last_car в клавиатуру НЕ вставляем (может быть длинным); он идёт в текст
- * сообщения.
- */
 export function carKeyboard(): InlineKeyboardMarkup {
   return {
     inline_keyboard: [
@@ -195,10 +171,6 @@ export function paymentKeyboard(): InlineKeyboardMarkup {
 // Admin: карточка заказа
 // ============================================================================
 
-/**
- * Кнопки под карточкой заказа в admin-чате. После delivered/cancelled клавиатуру
- * НЕ рисуем (при editMessageText передаём undefined в reply_markup, чтобы её убрать).
- */
 export function orderAdminKeyboard(orderId: string): InlineKeyboardMarkup {
   return {
     inline_keyboard: [
@@ -211,15 +183,10 @@ export function orderAdminKeyboard(orderId: string): InlineKeyboardMarkup {
   };
 }
 
-/** Пустая клавиатура — чтобы при editMessageText убрать кнопки статуса. */
 export function emptyKeyboard(): InlineKeyboardMarkup {
   return { inline_keyboard: [] };
 }
 
-/**
- * Клавиатура для admin-статуса, зависящая от текущего статуса. После
- * delivered/cancelled кнопок нет.
- */
 export function keyboardForOrderStatus(
   orderId: string,
   status: OrderStatus
@@ -229,13 +196,52 @@ export function keyboardForOrderStatus(
 }
 
 // ============================================================================
-// Admin: /стоп (наличие)
+// Admin: панель управления
 // ============================================================================
 
+export function adminPanelKeyboard(): InlineKeyboardMarkup {
+  return {
+    inline_keyboard: [
+      [
+        { text: "📦 Остатки", callback_data: "adm_panel:stock" },
+        { text: "📊 Статистика", callback_data: "adm_panel:stats" },
+      ],
+    ],
+  };
+}
+
+export function panelStatsKeyboard(): InlineKeyboardMarkup {
+  return {
+    inline_keyboard: [[{ text: "⬅️ Назад", callback_data: "adm_panel:home" }]],
+  };
+}
+
 /**
- * Клавиатура наличия: одна кнопка на позицию, значок ✅ / ⛔ отражает
- * текущее `available`.
+ * Редактор остатков: одна строка на полевую позицию.
+ * [−] [Айс-латте · 5 (🚚 2) ✅] [+]
+ * Центральная кнопка — toggle доступности (adm_avail:<slug>).
  */
+export function stockKeyboard(items: MenuItemRow[]): InlineKeyboardMarkup {
+  const rows: InlineKeyboardButton[][] = [];
+
+  for (const item of items) {
+    const status = item.available ? "✅" : "⛔";
+    const label = `${item.title} · ${item.stock_qty} (🚚 ${item.reserved_qty}) ${status}`;
+    rows.push([
+      { text: "−", callback_data: `adm_stk:${item.slug}:dec` },
+      { text: label, callback_data: `adm_avail:${item.slug}` },
+      { text: "+", callback_data: `adm_stk:${item.slug}:inc` },
+    ]);
+  }
+
+  rows.push([{ text: "⬅️ Назад", callback_data: "adm_panel:home" }]);
+  return { inline_keyboard: rows };
+}
+
+// ============================================================================
+// Admin: /стоп (устаревший, оставлен для backward compat)
+// ============================================================================
+
 export function stopKeyboard(items: MenuItemRow[]): InlineKeyboardMarkup {
   return {
     inline_keyboard: items.map((it) => [
@@ -277,7 +283,6 @@ export function confirmationKeyboard(groupUrl: string): InlineKeyboardMarkup {
   };
 }
 
-/** Клавиатура для «хочу 👀» подтверждения — только ссылка на группу. */
 export function wantConfirmKeyboard(groupUrl: string): InlineKeyboardMarkup {
   return {
     inline_keyboard: [
