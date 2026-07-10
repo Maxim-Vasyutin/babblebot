@@ -886,6 +886,7 @@ async function handlePay(
       await saveSession(session);
       return;
     }
+    // Fail-closed: unknown decrement error → не создаём заказ, сообщаем об ошибке
     console.error("decrement_stock_failed", { user_id: session.user_id, err: msg });
     await safeError(chatId);
     return;

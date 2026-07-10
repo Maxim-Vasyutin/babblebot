@@ -522,7 +522,7 @@ export async function returnStock(items: CartItem[]): Promise<void> {
 export async function decrementStock(items: CartItem[]): Promise<void> {
   const p_items = aggregateBySlug(items);
   const { error } = await supabase.rpc("decrement_stock", {
-    p_items: JSON.stringify(p_items),
+    p_items: p_items,
   });
   if (error) {
     // Пробрасываем как есть — в message будет "insufficient_stock:..."
