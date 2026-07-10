@@ -5,13 +5,17 @@
  *   /init   — привязать текущий чат как admin_chat_id.
  *   /панель — панель управления (остатки, статистика).
  *   /стоп   — алиас /панель, открывает сразу редактор остатков.
- *   /стат   — дневная сводка (Europe/Moscow).
+ *   /стат   — сводка по текущей смене.
  *
  * Callback:
  *   adm_panel:<section>              — навигация панели
- *   adm_stk:<slug>:<inc|dec>         — изменить остаток
- *   adm_avail:<slug>                 — toggle доступности (ручной стоп/старт)
- *   adm_stop:<slug>                  — backward compat, алиас adm_avail
+ *   adm_stock:<slug>:<inc|dec|toggle> — остаток / доступность
+ *   adm_stk:<slug>:<inc|dec>         — backward compat
+ *   adm_avail:<slug>                 — backward compat toggle
+ *   adm_stop:<slug>                  — backward compat
+ *   adm_shift_new                    — запрос подтверждения новой смены
+ *   adm_shift_go                     — открыть новую смену
+ *   adm_demand_all                   — спрос за всё время
  *   adm_status:<order_uuid>:<status> — сменить статус заказа
  */
 
@@ -20,20 +24,25 @@ import { CallbackData } from "@/lib/schemas";
 import { answerCallbackQuery, sendMessage } from "@/lib/telegram/api";
 import { supabase } from "@/lib/supabase/client";
 import {
-  getDailyStats,
+  cancelOrder,
+  getCurrentShift,
   getOrderById,
-  releaseReserved,
-  returnReserved,
+  getShiftAgeHours,
+  getShiftStats,
   setAdminChatId,
   updateOrderStatusGuarded,
 } from "@/lib/supabase/queries";
-import type { OrderStatus, PaymentMethod } from "@/types/database";
+import type { OrderStatus } from "@/types/database";
 import { formatRub } from "./format";
 import { editOrderCard } from "./admin_card";
 import {
   handleAdmAvailCb,
+  handleAdmDemandAllCb,
   handleAdmPanelCb,
+  handleAdmShiftGoCb,
+  handleAdmShiftNewCb,
   handleAdmStkCb,
+  handleAdmStockCb,
   openAdminPanel,
   openStockEditor,
 } from "./adminPanel";
@@ -145,24 +154,48 @@ async function handleInit(
 }
 
 // ============================================================================
-// /стат: дневная сводка
+// /стат: сводка по текущей смене (текстовая команда, без панели)
 // ============================================================================
 
 async function handleStat(chatId: number): Promise<void> {
   try {
-    const stats = await getDailyStats();
-    const date = moscowDate();
+    const shift = await getCurrentShift();
+
+    if (!shift) {
+      await sendMessage(chatId, "⚠️ Нет открытой смены. Нажмите «Новая смена» в панели.");
+      return;
+    }
+
+    const stats = await getShiftStats(shift.id);
+    const ageHours = getShiftAgeHours(shift);
+    const msk = new Date(new Date(shift.started_at).getTime() + 3 * 60 * 60 * 1000);
+    const months = [
+      "января", "февраля", "марта", "апреля", "мая", "июня",
+      "июля", "августа", "сентября", "октября", "ноября", "декабря",
+    ];
+    const hh = String(msk.getUTCHours()).padStart(2, "0");
+    const mm = String(msk.getUTCMinutes()).padStart(2, "0");
+    const shiftDate = `${msk.getUTCDate()} ${months[msk.getUTCMonth()]}, ${hh}:${mm}`;
+    const ageLabel =
+      ageHours < 1 ? "меньше часа" : `${Math.floor(ageHours)} ч`;
 
     if (
       stats.count === 0 &&
       stats.waited_sold_out.length === 0 &&
       stats.wanted_not_carried.length === 0
     ) {
-      await sendMessage(chatId, "Сегодня пока пусто.");
+      await sendMessage(chatId, `Смена от ${shiftDate} — заказов пока нет.`);
       return;
     }
 
-    const lines: string[] = [`📊 <b>Сегодня (${date}):</b>`];
+    const lines: string[] = [];
+
+    if (ageHours > 16) {
+      lines.push("⚠️ <b>Смена не закрыта, цифры могут врать</b>");
+      lines.push("");
+    }
+
+    lines.push(`📊 <b>Смена от ${shiftDate} (идёт ${ageLabel}):</b>`);
     lines.push(`Заказов: ${stats.count} · Выручка: ${formatRub(stats.total_kop)}`);
 
     const p = stats.by_payment;
@@ -176,58 +209,48 @@ async function handleStat(chatId: number): Promise<void> {
       lines.push("");
       lines.push(
         "📦 <b>Остатки:</b> " +
-          stats.stock.map((it) => `${it.title} — ${it.stock_qty}`).join(" · ")
+          stats.stock.map((it) => `${it.title} — ${it.stock}`).join(" · ")
       );
     }
 
     if (stats.top_items.length > 0) {
       lines.push("");
-      lines.push("🔥 <b>Заказывали:</b>");
       lines.push(
-        stats.top_items
-          .slice(0, 5)
-          .map((it) => `${it.title} — ${it.qty}`)
-          .join(" · ")
+        "🔥 <b>Заказывали:</b> " +
+          stats.top_items
+            .slice(0, 5)
+            .map((it) => `${it.title} — ${it.qty}`)
+            .join(" · ")
       );
     }
 
     if (stats.waited_sold_out.length > 0) {
       lines.push("");
-      lines.push("⏳ <b>Ждали (кончилось):</b>");
       lines.push(
-        stats.waited_sold_out
-          .slice(0, 5)
-          .map((it) => `${it.title} — ${it.count}`)
-          .join(" · ")
+        "⏳ <b>Ждали (кончилось):</b> " +
+          stats.waited_sold_out
+            .slice(0, 5)
+            .map((it) => `${it.title} — ${it.count}`)
+            .join(" · ")
       );
     }
 
     if (stats.wanted_not_carried.length > 0) {
       lines.push("");
-      lines.push("👀 <b>Хотели (не возим):</b>");
       lines.push(
-        stats.wanted_not_carried
-          .slice(0, 5)
-          .map((it) => `${it.title} — ${it.count}`)
-          .join(" · ")
+        "👀 <b>Хотели (не возим):</b> " +
+          stats.wanted_not_carried
+            .slice(0, 5)
+            .map((it) => `${it.title} — ${it.count}`)
+            .join(" · ")
       );
     }
 
     await sendMessage(chatId, lines.join("\n"));
-    void (0 as unknown as PaymentMethod);
   } catch (err) {
     console.error("admin_stat_failed", { err: String(err) });
     try { await sendMessage(chatId, "⚠️ Не удалось собрать сводку."); } catch { /* ignore */ }
   }
-}
-
-function moscowDate(): string {
-  const msk = new Date(Date.now() + 3 * 60 * 60 * 1000);
-  const months = [
-    "января", "февраля", "марта", "апреля", "мая", "июня",
-    "июля", "августа", "сентября", "октября", "ноября", "декабря",
-  ];
-  return `${msk.getUTCDate()} ${months[msk.getUTCMonth()]}`;
 }
 
 // ============================================================================
@@ -258,15 +281,29 @@ async function handleAdminCallback(
       case "adm_panel":
         await handleAdmPanelCb(chatId, cb, arg1);
         return;
+      case "adm_stock":
+        await handleAdmStockCb(chatId, cb, arg1, arg2);
+        return;
       case "adm_stk":
+        // backward compat: old messages
         await handleAdmStkCb(chatId, cb, arg1, arg2);
         return;
       case "adm_avail":
+        // backward compat
         await handleAdmAvailCb(chatId, cb, arg1);
         return;
       case "adm_stop":
-        // Backward compat: old messages still have adm_stop: buttons
+        // backward compat
         await handleAdmAvailCb(chatId, cb, arg1);
+        return;
+      case "adm_shift_new":
+        await handleAdmShiftNewCb(chatId, cb);
+        return;
+      case "adm_shift_go":
+        await handleAdmShiftGoCb(chatId, cb);
+        return;
+      case "adm_demand_all":
+        await handleAdmDemandAllCb(chatId, cb);
         return;
       case "adm_status":
         await handleAdmStatus(chatId, cb, arg1, arg2);
@@ -292,35 +329,28 @@ async function handleAdmStatus(
     return;
   }
 
-  const handler = cb.from.username ?? undefined;
-  const { updated } = await updateOrderStatusGuarded(
-    orderId,
-    status as OrderStatus,
-    handler
-  );
+  const handler = cb.from.username ?? `id${cb.from.id}`;
 
-  if (!updated) {
-    await answerCallbackQuery(cb.id, "Заказ уже обработан");
-    return;
-  }
-
-  const order = await getOrderById(orderId);
-  if (!order) return;
-
-  // Release or return reserved stock
-  if (status === "delivered") {
+  if (status === "cancelled") {
+    // cancel_order RPC: меняет статус + возвращает остаток (только своя смена)
+    let cancelled: boolean;
     try {
-      await releaseReserved(order.items);
+      cancelled = await cancelOrder(orderId, handler);
     } catch (err) {
-      console.error("release_reserved_failed", { order_id: orderId, err: String(err) });
+      console.error("cancel_order_rpc_failed", { order_id: orderId, err: String(err) });
+      await answerCallbackQuery(cb.id, "Ошибка. Попробуйте ещё раз.");
+      return;
     }
-  } else if (status === "cancelled") {
-    try {
-      await returnReserved(order.items);
-    } catch (err) {
-      console.error("return_reserved_failed", { order_id: orderId, err: String(err) });
+
+    if (!cancelled) {
+      await answerCallbackQuery(cb.id, "Заказ уже обработан");
+      return;
     }
-    // Notify the client — 403 (bot blocked) is expected and non-fatal
+
+    const order = await getOrderById(orderId);
+    if (!order) return;
+
+    // Уведомить клиента — 403 (bot blocked) ожидаем, не фатально
     try {
       await sendMessage(
         order.user_id,
@@ -339,7 +369,28 @@ async function handleAdmStatus(
         err: String(notifyErr),
       });
     }
+
+    if (!order.admin_message_id && cb.message?.message_id) {
+      order.admin_message_id = cb.message.message_id;
+    }
+    await editOrderCard(chatId, order);
+    return;
   }
+
+  // in_progress / delivered — guard-обновление (без stock-операций: direct-decrement модель)
+  const { updated } = await updateOrderStatusGuarded(
+    orderId,
+    status as OrderStatus,
+    handler
+  );
+
+  if (!updated) {
+    await answerCallbackQuery(cb.id, "Заказ уже обработан");
+    return;
+  }
+
+  const order = await getOrderById(orderId);
+  if (!order) return;
 
   if (!order.admin_message_id && cb.message?.message_id) {
     order.admin_message_id = cb.message.message_id;

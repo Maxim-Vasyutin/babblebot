@@ -68,8 +68,8 @@ export function buildAbout(): ScreenPayload {
 }
 
 export function buildMenu(items: MenuItemRow[], cart: CartItem[]): ScreenPayload {
-  const available = items.filter((i) => i.available && i.stock_qty > 0);
-  const unavailable = items.filter((i) => !i.available || i.stock_qty === 0);
+  const available = items.filter((i) => i.available && i.stock > 0);
+  const unavailable = items.filter((i) => !i.available || i.stock === 0);
   const count = cartTotalQty(cart);
   const totalKop = cartTotalKop(cart);
 

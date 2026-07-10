@@ -2,21 +2,21 @@
  * Все обращения к БД проходят здесь. Server-only, использует service-role клиент.
  *
  * Принципы (SPEC.md, Блок 2 / rules/database.md):
- * - Атомарные операции — через RPC (next_order_number, reserve_stock и пр.).
+ * - Атомарные операции — через RPC (next_order_number, decrement_stock и пр.).
  * - Заказ — снапшот корзины (JSONB), не нормализуется.
- * - «Сегодня» в отчётах — Europe/Moscow, а не UTC.
+ * - «Сегодня» заменено посменным учётом: всё считается от shifts.started_at.
  * - Деньги — INTEGER в копейках. Никаких float.
  */
 
 import { supabase } from "@/lib/supabase/client";
 import type {
   CartItem,
-  DemandEventKind,
+  DemandEventReason,
   MenuItemRow,
   OrderRow,
   OrderStatus,
   PaymentMethod,
-  ReserveStockResult,
+  ShiftRow,
   UserSessionRow,
 } from "@/types/database";
 
@@ -32,14 +32,17 @@ export type CreateOrderData = {
   landmark: string;
   car: string;
   payment_method: PaymentMethod;
+  shift_id: string;
 };
 
-export type DailyStats = {
+export type ShiftStats = {
+  shiftId: string;
+  startedAt: string;
   count: number;
   total_kop: number;
   by_payment: Record<PaymentMethod, number>;
   top_items: Array<{ title: string; qty: number }>;
-  stock: Array<{ slug: string; title: string; stock_qty: number; reserved_qty: number }>;
+  stock: Array<{ slug: string; title: string; stock: number }>;
   waited_sold_out: Array<{ title: string; count: number }>;
   wanted_not_carried: Array<{ title: string; count: number }>;
 };
@@ -162,7 +165,7 @@ export async function toggleAvailability(slug: string): Promise<boolean> {
 }
 
 /**
- * Adjust stock_qty by delta (clamped to >= 0).
+ * Adjust stock by delta (clamped to >= 0).
  * Returns new qty and whether the decrement was blocked at zero.
  */
 export async function updateStockQty(
@@ -171,7 +174,7 @@ export async function updateStockQty(
 ): Promise<{ newQty: number; clamped: boolean }> {
   const { data, error: readErr } = await supabase
     .from("menu_items")
-    .select("stock_qty")
+    .select("stock")
     .eq("slug", slug)
     .maybeSingle();
 
@@ -179,13 +182,13 @@ export async function updateStockQty(
     throw new Error(`updateStockQty read failed: ${readErr?.message ?? "no row"}`);
   }
 
-  const current = (data as { stock_qty: number }).stock_qty;
+  const current = (data as { stock: number }).stock;
   const clamped = delta < 0 && current === 0;
   const newQty = Math.max(0, current + delta);
 
   const { error: updErr } = await supabase
     .from("menu_items")
-    .update({ stock_qty: newQty })
+    .update({ stock: newQty })
     .eq("slug", slug);
 
   if (updErr) {
@@ -215,6 +218,7 @@ export async function createOrder(data: CreateOrderData): Promise<OrderRow> {
       landmark: data.landmark,
       car: data.car,
       payment_method: data.payment_method,
+      shift_id: data.shift_id,
       status: "new",
     })
     .select("*")
@@ -259,20 +263,6 @@ export async function updateOrderStatusGuarded(
     throw new Error(`updateOrderStatusGuarded failed: ${error.message}`);
   }
   return { updated: data !== null };
-}
-
-export async function updateOrderStatus(
-  orderId: string,
-  status: OrderStatus,
-  handledBy?: string
-): Promise<void> {
-  const patch: { status: OrderStatus; handled_by?: string } = { status };
-  if (handledBy !== undefined) patch.handled_by = handledBy;
-
-  const { error } = await supabase.from("orders").update(patch).eq("id", orderId);
-  if (error) {
-    throw new Error(`updateOrderStatus failed: ${error.message}`);
-  }
 }
 
 export async function setOrderAdminMessageId(
@@ -370,82 +360,24 @@ export async function setWaitlistInfo(messageId: number, date: string): Promise<
 // demand_events
 // ============================================================================
 
+/**
+ * Записывает событие спроса через RPC bump_demand.
+ * reason: 'sold_out' — позиция закончилась; 'unavailable' — снята или не в каталоге.
+ */
 export async function recordDemandEvent(
   slug: string,
   title: string,
-  kind: DemandEventKind,
-  userId: number
+  userId: number,
+  reason: DemandEventReason
 ): Promise<void> {
-  const { error } = await supabase
-    .from("demand_events")
-    .insert({ slug, title, kind, user_id: userId });
+  const { error } = await supabase.rpc("bump_demand", {
+    p_slug: slug,
+    p_title: title,
+    p_user_id: userId,
+    p_reason: reason,
+  });
   if (error) {
-    throw new Error(`recordDemandEvent failed: ${error.message}`);
-  }
-}
-
-export async function getDemandEventsToday(
-  kind: DemandEventKind
-): Promise<Array<{ title: string; count: number }>> {
-  const { fromIso, toIso } = moscowTodayRange();
-  const { data, error } = await supabase
-    .from("demand_events")
-    .select("title")
-    .eq("kind", kind)
-    .gte("created_at", fromIso)
-    .lt("created_at", toIso);
-
-  if (error) {
-    throw new Error(`getDemandEventsToday failed: ${error.message}`);
-  }
-
-  const counts = new Map<string, number>();
-  for (const row of (data ?? []) as Array<{ title: string }>) {
-    counts.set(row.title, (counts.get(row.title) ?? 0) + 1);
-  }
-  return [...counts.entries()]
-    .map(([title, count]) => ({ title, count }))
-    .sort((a, b) => b.count - a.count);
-}
-
-// ============================================================================
-// Stock RPCs
-// ============================================================================
-
-function aggregateBySlug(items: CartItem[]): Array<{ slug: string; qty: number }> {
-  const bySlug = new Map<string, number>();
-  for (const item of items) {
-    bySlug.set(item.slug, (bySlug.get(item.slug) ?? 0) + item.qty);
-  }
-  return [...bySlug.entries()].map(([slug, qty]) => ({ slug, qty }));
-}
-
-export async function reserveStock(items: CartItem[]): Promise<ReserveStockResult> {
-  const p_items = aggregateBySlug(items);
-  const { data, error } = await supabase.rpc("reserve_stock", { p_items });
-  if (error) {
-    throw new Error(`reserve_stock RPC failed: ${error.message}`);
-  }
-  const result = data as { ok: boolean; short?: Array<{ slug: string; available: number }> };
-  if (!result.ok) {
-    return { ok: false, short: result.short ?? [] };
-  }
-  return { ok: true };
-}
-
-export async function releaseReserved(items: CartItem[]): Promise<void> {
-  const p_items = aggregateBySlug(items);
-  const { error } = await supabase.rpc("release_reserved", { p_items });
-  if (error) {
-    throw new Error(`release_reserved RPC failed: ${error.message}`);
-  }
-}
-
-export async function returnReserved(items: CartItem[]): Promise<void> {
-  const p_items = aggregateBySlug(items);
-  const { error } = await supabase.rpc("return_reserved", { p_items });
-  if (error) {
-    throw new Error(`return_reserved RPC failed: ${error.message}`);
+    throw new Error(`recordDemandEvent (bump_demand) failed: ${error.message}`);
   }
 }
 
@@ -478,40 +410,124 @@ export async function insertProcessedUpdate(updateId: number): Promise<boolean> 
 }
 
 // ============================================================================
-// /стат — дневная сводка (Europe/Moscow)
+// shifts
+// ============================================================================
+
+export async function getCurrentShift(): Promise<ShiftRow | null> {
+  const { data, error } = await supabase
+    .from("shifts")
+    .select("*")
+    .is("ended_at", null)
+    .maybeSingle();
+
+  if (error) {
+    throw new Error(`getCurrentShift failed: ${error.message}`);
+  }
+  return (data as ShiftRow | null) ?? null;
+}
+
+/** Возвращает возраст смены в часах (дробное). */
+export function getShiftAgeHours(shift: ShiftRow): number {
+  return (Date.now() - new Date(shift.started_at).getTime()) / (1000 * 60 * 60);
+}
+
+/** Открывает новую смену через RPC (закрывает старую + сбрасывает остатки). */
+export async function startShift(startedBy: string): Promise<string> {
+  const { data, error } = await supabase.rpc("start_shift", {
+    p_started_by: startedBy,
+  });
+  if (error) {
+    throw new Error(`start_shift RPC failed: ${error.message}`);
+  }
+  return data as string;
+}
+
+// ============================================================================
+// Stock RPCs
+// ============================================================================
+
+function aggregateBySlug(items: CartItem[]): Array<{ slug: string; qty: number }> {
+  const bySlug = new Map<string, number>();
+  for (const item of items) {
+    bySlug.set(item.slug, (bySlug.get(item.slug) ?? 0) + item.qty);
+  }
+  return [...bySlug.entries()].map(([slug, qty]) => ({ slug, qty }));
+}
+
+/**
+ * Возвращает остатки после сбоя createOrder (роллбэк).
+ * Используется только в редком пути ошибки — read-modify-write здесь допустим.
+ */
+export async function returnStock(items: CartItem[]): Promise<void> {
+  const bySlug = aggregateBySlug(items);
+  for (const { slug, qty } of bySlug) {
+    const { data, error: readErr } = await supabase
+      .from("menu_items")
+      .select("stock")
+      .eq("slug", slug)
+      .maybeSingle();
+    if (readErr || !data) continue;
+    const current = (data as { stock: number }).stock;
+    await supabase
+      .from("menu_items")
+      .update({ stock: current + qty })
+      .eq("slug", slug);
+  }
+}
+
+/**
+ * Атомарное списание остатков через RPC decrement_stock.
+ * При нехватке бросает ошибку вида "insufficient_stock:slug1,slug2".
+ * Вызывающий код должен поймать её и обработать (Edge Case 1).
+ */
+export async function decrementStock(items: CartItem[]): Promise<void> {
+  const p_items = aggregateBySlug(items);
+  const { error } = await supabase.rpc("decrement_stock", {
+    p_items: JSON.stringify(p_items),
+  });
+  if (error) {
+    // Пробрасываем как есть — в message будет "insufficient_stock:..."
+    throw new Error(error.message);
+  }
+}
+
+/**
+ * Отмена заказа через RPC cancel_order.
+ * Возвращает false если заказ уже отменён/доставлен (идемпотентно).
+ * Возврат остатка происходит только если заказ принадлежит текущей смене.
+ */
+export async function cancelOrder(
+  orderId: string,
+  handledBy: string
+): Promise<boolean> {
+  const { data, error } = await supabase.rpc("cancel_order", {
+    p_order_id: orderId,
+    p_handled_by: handledBy,
+  });
+  if (error) {
+    throw new Error(`cancel_order RPC failed: ${error.message}`);
+  }
+  return data as boolean;
+}
+
+// ============================================================================
+// /стат — посменная сводка
 // ============================================================================
 
 const PAYMENT_KEYS: PaymentMethod[] = ["sbp", "cash", "terminal"];
 
-function moscowTodayRange(): { fromIso: string; toIso: string } {
-  const now = new Date();
-  const mskNow = new Date(now.getTime() + 3 * 60 * 60 * 1000);
-  const y = mskNow.getUTCFullYear();
-  const m = mskNow.getUTCMonth();
-  const d = mskNow.getUTCDate();
+export async function getShiftStats(shiftId: string): Promise<ShiftStats> {
+  const shift = await getCurrentShift();
 
-  const startUtc = Date.UTC(y, m, d) - 3 * 60 * 60 * 1000;
-  const endUtc = startUtc + 24 * 60 * 60 * 1000;
-
-  return {
-    fromIso: new Date(startUtc).toISOString(),
-    toIso: new Date(endUtc).toISOString(),
-  };
-}
-
-export async function getDailyStats(): Promise<DailyStats> {
-  const { fromIso, toIso } = moscowTodayRange();
-
-  // Orders
+  // Orders in this shift (excluding cancelled)
   const { data: orders, error: ordErr } = await supabase
     .from("orders")
     .select("total_kop,payment_method,items,status")
-    .gte("created_at", fromIso)
-    .lt("created_at", toIso)
+    .eq("shift_id", shiftId)
     .neq("status", "cancelled");
 
   if (ordErr) {
-    throw new Error(`getDailyStats orders failed: ${ordErr.message}`);
+    throw new Error(`getShiftStats orders failed: ${ordErr.message}`);
   }
 
   const byPayment: Record<PaymentMethod, number> = { sbp: 0, cash: 0, terminal: 0 };
@@ -553,52 +569,48 @@ export async function getDailyStats(): Promise<DailyStats> {
   // Current stock
   const { data: stockData, error: stockErr } = await supabase
     .from("menu_items")
-    .select("slug,title,stock_qty,reserved_qty")
+    .select("slug,title,stock")
     .eq("field_item", true)
     .order("sort_order", { ascending: true });
 
   if (stockErr) {
-    throw new Error(`getDailyStats stock failed: ${stockErr.message}`);
+    throw new Error(`getShiftStats stock failed: ${stockErr.message}`);
   }
 
-  const stock = (stockData ?? []) as Array<{
-    slug: string;
-    title: string;
-    stock_qty: number;
-    reserved_qty: number;
-  }>;
+  const stock = (stockData ?? []) as Array<{ slug: string; title: string; stock: number }>;
 
-  // Demand events for today
+  // Demand events for this shift
   const { data: demandData, error: demErr } = await supabase
     .from("demand_events")
-    .select("title,kind")
-    .gte("created_at", fromIso)
-    .lt("created_at", toIso);
+    .select("title,reason")
+    .eq("shift_id", shiftId);
 
   if (demErr) {
-    throw new Error(`getDailyStats demand failed: ${demErr.message}`);
+    throw new Error(`getShiftStats demand failed: ${demErr.message}`);
   }
 
   const soldOutAgg = new Map<string, number>();
-  const notCarriedAgg = new Map<string, number>();
+  const unavailableAgg = new Map<string, number>();
 
-  for (const row of (demandData ?? []) as Array<{ title: string; kind: string }>) {
-    if (row.kind === "sold_out") {
+  for (const row of (demandData ?? []) as Array<{ title: string; reason: string }>) {
+    if (row.reason === "sold_out") {
       soldOutAgg.set(row.title, (soldOutAgg.get(row.title) ?? 0) + 1);
-    } else if (row.kind === "not_carried") {
-      notCarriedAgg.set(row.title, (notCarriedAgg.get(row.title) ?? 0) + 1);
+    } else if (row.reason === "unavailable") {
+      unavailableAgg.set(row.title, (unavailableAgg.get(row.title) ?? 0) + 1);
     }
   }
 
   const waited_sold_out = [...soldOutAgg.entries()]
-    .map(([title, count2]) => ({ title, count: count2 }))
+    .map(([title, c]) => ({ title, count: c }))
     .sort((a, b) => b.count - a.count);
 
-  const wanted_not_carried = [...notCarriedAgg.entries()]
-    .map(([title, count2]) => ({ title, count: count2 }))
+  const wanted_not_carried = [...unavailableAgg.entries()]
+    .map(([title, c]) => ({ title, count: c }))
     .sort((a, b) => b.count - a.count);
 
   return {
+    shiftId,
+    startedAt: shift?.started_at ?? new Date().toISOString(),
     count,
     total_kop: totalKop,
     by_payment: byPayment,
@@ -607,4 +619,55 @@ export async function getDailyStats(): Promise<DailyStats> {
     waited_sold_out,
     wanted_not_carried,
   };
+}
+
+/** Кончившиеся позиции за текущую смену (для табло ожидания). */
+export async function getDemandSoldOutCurrentShift(): Promise<
+  Array<{ title: string; count: number }>
+> {
+  const shift = await getCurrentShift();
+  if (!shift) return [];
+
+  const { data, error } = await supabase
+    .from("demand_events")
+    .select("title")
+    .eq("reason", "sold_out")
+    .eq("shift_id", shift.id);
+
+  if (error) {
+    throw new Error(`getDemandSoldOutCurrentShift failed: ${error.message}`);
+  }
+
+  const counts = new Map<string, number>();
+  for (const row of (data ?? []) as Array<{ title: string }>) {
+    counts.set(row.title, (counts.get(row.title) ?? 0) + 1);
+  }
+  return [...counts.entries()]
+    .map(([title, count]) => ({ title, count }))
+    .sort((a, b) => b.count - a.count);
+}
+
+/** Спрос за всё время, агрегированный по title+reason. */
+export async function getAllTimeDemand(): Promise<
+  Array<{ title: string; count: number; reason: string }>
+> {
+  const { data, error } = await supabase
+    .from("demand_events")
+    .select("title,reason");
+
+  if (error) {
+    throw new Error(`getAllTimeDemand failed: ${error.message}`);
+  }
+
+  const agg = new Map<string, { title: string; count: number; reason: string }>();
+  for (const row of (data ?? []) as Array<{ title: string; reason: string }>) {
+    const key = `${row.reason}:${row.title}`;
+    const prev = agg.get(key);
+    if (prev) {
+      prev.count += 1;
+    } else {
+      agg.set(key, { title: row.title, count: 1, reason: row.reason });
+    }
+  }
+  return [...agg.values()].sort((a, b) => b.count - a.count);
 }

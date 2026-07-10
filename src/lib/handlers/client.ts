@@ -20,12 +20,12 @@ import type {
 import { answerCallbackQuery, sendMessage } from "@/lib/telegram/api";
 import {
   createOrder,
+  decrementStock,
   getAdminChatId,
+  getCurrentShift,
   getMenuItems,
   recordDemandEvent,
-  releaseReserved,
-  reserveStock,
-  returnReserved,
+  returnStock,
   saveSession,
   setOrderAdminMessageId,
 } from "@/lib/supabase/queries";
@@ -315,7 +315,7 @@ async function handleCallback(
 // ============================================================================
 
 function isAvailable(item: MenuItemRow): boolean {
-  return item.available && item.stock_qty > 0;
+  return item.available && item.stock > 0;
 }
 
 async function handleItemTap(
@@ -528,17 +528,18 @@ async function handleWant(
   const items = await getMenuItems();
   const item = items.find((i) => i.slug === slug);
   const title = item?.title ?? slug;
-  const kind = item?.field_item ? "sold_out" : "not_carried";
+  // sold_out — позиция есть в каталоге, но stock = 0; unavailable — снята или не в каталоге
+  const reason = (item && item.stock === 0) ? "sold_out" as const : "unavailable" as const;
 
-  await recordDemandEvent(slug, title, kind, fromUserId);
+  await recordDemandEvent(slug, title, fromUserId, reason);
 
   const toastText =
-    kind === "sold_out"
+    reason === "sold_out"
       ? "Уже разобрали 🙈 Записали, что ждёте"
       : "Записали! 🐾 Наберётся спрос — привезём";
   await answerCallbackQuery(cbId, toastText);
 
-  if (kind === "sold_out") {
+  if (reason === "sold_out") {
     try {
       const adminChatId = await getAdminChatId();
       if (adminChatId !== null) {
@@ -553,7 +554,7 @@ async function handleWant(
     }
   }
 
-  if (kind === "not_carried") {
+  if (reason === "unavailable") {
     try {
       await sendWantAck(chatId, title);
     } catch {
@@ -706,46 +707,109 @@ async function handlePay(
     return;
   }
 
-  // 1. Reserve stock atomically before creating the order
-  let reserveResult;
+  // 1. Проверить наличие открытой смены (Edge Case 5)
+  let currentShift;
   try {
-    reserveResult = await reserveStock(cart);
+    currentShift = await getCurrentShift();
   } catch (err) {
-    console.error("reserve_stock_failed", { user_id: session.user_id, err: String(err) });
+    console.error("get_current_shift_failed", { user_id: session.user_id, err: String(err) });
     await safeError(chatId);
     return;
   }
+  if (!currentShift) {
+    await answerCallbackQuery(cbId, "⚠️ Приём заказов приостановлен");
+    await sendMessage(
+      chatId,
+      "⚠️ Приём заказов временно приостановлен.\nПопробуйте через несколько минут."
+    );
+    return;
+  }
 
-  if (!reserveResult.ok) {
-    // Some items ran out — correct cart and return to cart screen
-    const shortBySlug = new Map(reserveResult.short.map((s) => [s.slug, s.available]));
-    const correctedCart: CartItem[] = [];
+  // 2. Отфильтровать недоступные позиции (available=false или stock=0)
+  const items = await getMenuItems();
+  const { cart: filteredCart, dropped } = filterAvailable(cart, items);
 
-    for (const item of cart) {
-      const available = shortBySlug.get(item.slug);
-      if (available === undefined) {
-        correctedCart.push(item);
-      } else if (available > 0) {
-        correctedCart.push({ ...item, qty: available });
-      }
-      // else: fully out — skip
-    }
+  if (dropped.length > 0 && filteredCart.length === 0) {
+    // Edge Case 3: корзина опустела — заказ не создаём
+    session.state = "browsing";
+    session.cart = [];
+    session.context = {};
+    session.ui_message_id = null;
+    await saveSession(session);
+    await deleteOldUi(chatId, uiMsgId);
+    await sendMessage(
+      chatId,
+      "Всё из вашего заказа разобрали 🙈\nВыберите что-то другое!",
+      { reply_markup: { inline_keyboard: [[{ text: "🧋 Меню", callback_data: "menu" }]] } }
+    );
+    return;
+  }
 
-    session.cart = correctedCart;
+  if (dropped.length > 0) {
+    // Edge Case 2: часть позиций снята — обновляем корзину, возвращаем на cart
+    session.cart = filteredCart;
     session.state = "cart";
-    await answerCallbackQuery(cbId, "Часть позиций закончилась — обновили корзину 🛒");
-    const screen = buildCart(correctedCart);
+    await answerCallbackQuery(cbId, "Часть позиций закончилась — корзину обновили 🛒");
+    const screen = buildCart(filteredCart);
     const newId = await renderScreen(chatId, uiMsgId, screen.text, screen.options);
     session.ui_message_id = newId;
     await saveSession(session);
     return;
   }
 
-  const totalKop = cartTotalKop(cart);
-  const snapshotCart = cart.slice();
+  // 3. Атомарное списание (Edge Case 1: гонка за последнюю штуку)
+  try {
+    await decrementStock(filteredCart);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.includes("insufficient_stock:")) {
+      // Парсим, каких slug не хватило
+      const failedSlugs = new Set(
+        msg.replace(/^.*insufficient_stock:/, "").split(",").map((s) => s.trim())
+      );
+      const corrected = filteredCart.filter((it) => !failedSlugs.has(it.slug));
+
+      if (corrected.length === 0) {
+        // Edge Case 3: всё разобрали
+        session.state = "browsing";
+        session.cart = [];
+        session.context = {};
+        session.ui_message_id = null;
+        await saveSession(session);
+        await deleteOldUi(chatId, uiMsgId);
+        await sendMessage(
+          chatId,
+          "Всё из вашего заказа разобрали 🙈\nВыберите что-то другое!",
+          { reply_markup: { inline_keyboard: [[{ text: "🧋 Меню", callback_data: "menu" }]] } }
+        );
+        return;
+      }
+
+      session.cart = corrected;
+      session.state = "cart";
+      const failedTitles = filteredCart
+        .filter((it) => failedSlugs.has(it.slug))
+        .map((it) => it.title)
+        .join(", ");
+      await answerCallbackQuery(
+        cbId,
+        `${failedTitles} разобрали — убрали из заказа. Оформить остальное?`
+      );
+      const screen = buildCart(corrected);
+      const newId = await renderScreen(chatId, uiMsgId, screen.text, screen.options);
+      session.ui_message_id = newId;
+      await saveSession(session);
+      return;
+    }
+    console.error("decrement_stock_failed", { user_id: session.user_id, err: msg });
+    await safeError(chatId);
+    return;
+  }
+
+  const totalKop = cartTotalKop(filteredCart);
+  const snapshotCart = filteredCart.slice();
 
   // КРИТИЧНО: сбрасываем state ДО отправки в Telegram (защита от двойного заказа).
-  // Также сбрасываем ui_message_id — чек не является UI-экраном.
   session.state = "browsing";
   session.cart = [];
   session.context = {};
@@ -766,6 +830,7 @@ async function handlePay(
       landmark,
       car,
       payment_method: paymentMethod,
+      shift_id: currentShift.id,
     });
     orderId = order.id;
     orderNumber = order.order_number;
@@ -800,16 +865,16 @@ async function handlePay(
       user_id: session.user_id,
       err: String(err),
     });
-    // Order was NOT created — return reserved stock
+    // Заказ НЕ создан, но stock уже был списан — возвращаем остаток
     try {
-      await returnReserved(snapshotCart);
+      await returnStock(snapshotCart);
     } catch (retErr) {
-      console.error("return_reserved_on_rollback_failed", {
+      console.error("return_stock_on_rollback_failed", {
         user_id: session.user_id,
         err: String(retErr),
       });
     }
-    // Restore session
+    // Восстановить сессию
     session.state = "checkout_payment";
     session.cart = snapshotCart;
     session.context = { car, landmark };
@@ -826,7 +891,6 @@ async function handlePay(
   }
 
   void paymentLabel;
-  void releaseReserved;
 }
 
 // ============================================================================

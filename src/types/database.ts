@@ -1,7 +1,7 @@
 /**
  * Типы БД Queue Cat / Bubble Cat.
  *
- * Соответствуют схеме из supabase/migrations/ (0001 + 0002).
+ * Соответствуют схеме из supabase/migrations/ (0001–0004 + v1.2).
  * Правила:
  * - Денежные значения — INTEGER в копейках (250 ₽ = 25000). Никаких float.
  * - user_id в user_sessions и orders — Telegram from.id (BIGINT), НЕ FK на auth.users.
@@ -28,7 +28,8 @@ export type OrderStatus = 'new' | 'in_progress' | 'delivered' | 'cancelled';
 
 export type VariantGroup = 'syrup' | 'tea' | null;
 
-export type DemandEventKind = 'sold_out' | 'not_carried';
+/** sold_out — позиция кончилась (stock=0); unavailable — снята или не в каталоге. */
+export type DemandEventReason = 'sold_out' | 'unavailable';
 
 export type CartItem = {
   slug: string;
@@ -48,6 +49,15 @@ export type AppSettingRow = {
   updated_at: string;
 };
 
+export type ShiftRow = {
+  id: string;
+  started_at: string;
+  ended_at: string | null;
+  started_by: string | null;
+  note: string | null;
+  created_at: string;
+};
+
 export type MenuItemRow = {
   id: string;
   slug: string;
@@ -57,8 +67,7 @@ export type MenuItemRow = {
   field_item: boolean;
   available: boolean;
   sort_order: number;
-  stock_qty: number;
-  reserved_qty: number;
+  stock: number;
   created_at: string;
   updated_at: string;
 };
@@ -86,6 +95,7 @@ export type OrderRow = {
   car: string;
   payment_method: PaymentMethod;
   status: OrderStatus;
+  shift_id: string | null;
   admin_message_id: number | null;
   handled_by: string | null;
   created_at: string;
@@ -96,8 +106,9 @@ export type DemandEventRow = {
   id: string;
   slug: string;
   title: string;
-  kind: DemandEventKind;
+  reason: DemandEventReason;
   user_id: number | null;
+  shift_id: string | null;
   created_at: string;
 };
 
@@ -117,9 +128,3 @@ export type AppSettingKey =
 // ============================================================================
 
 export type NextOrderNumberReturn = number;
-
-export type ReserveStockItem = { slug: string; qty: number };
-export type ReserveStockShortage = { slug: string; available: number };
-export type ReserveStockResult =
-  | { ok: true }
-  | { ok: false; short: ReserveStockShortage[] };

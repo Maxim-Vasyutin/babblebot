@@ -84,7 +84,7 @@ export function filterAvailable(
   items: MenuItemRow[]
 ): { cart: CartItem[]; dropped: string[] } {
   const availableSlugs = new Set(
-    items.filter((i) => i.available && i.stock_qty > 0).map((i) => i.slug)
+    items.filter((i) => i.available && i.stock > 0).map((i) => i.slug)
   );
   const kept: CartItem[] = [];
   const dropped: string[] = [];

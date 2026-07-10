@@ -8,7 +8,7 @@
 
 import { editMessageText, sendMessage } from "@/lib/telegram/api";
 import {
-  getDemandEventsToday,
+  getDemandSoldOutCurrentShift,
   getWaitlistInfo,
   setWaitlistInfo,
 } from "@/lib/supabase/queries";
@@ -33,10 +33,10 @@ function buildWaitlistText(
 
 /**
  * Обновить (или создать) табло ожидания в admin-чате.
- * Вызывается после записи demand_event с kind='sold_out'.
+ * Вызывается после записи demand_event с reason='sold_out'.
  */
 export async function updateWaitlistBoard(adminChatId: number): Promise<void> {
-  const waited = await getDemandEventsToday("sold_out");
+  const waited = await getDemandSoldOutCurrentShift();
   if (waited.length === 0) return;
 
   const today = moscowDateString();

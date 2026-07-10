@@ -218,25 +218,48 @@ export function adminPanelKeyboard(): InlineKeyboardMarkup {
 
 export function panelStatsKeyboard(): InlineKeyboardMarkup {
   return {
-    inline_keyboard: [[{ text: "⬅️ Назад", callback_data: "adm_panel:home" }]],
+    inline_keyboard: [
+      [
+        { text: "👀 Спрос за всё время", callback_data: "adm_demand_all" },
+        { text: "🔄 Новая смена", callback_data: "adm_shift_new" },
+      ],
+      [{ text: "⬅️ Назад", callback_data: "adm_panel:home" }],
+    ],
+  };
+}
+
+export function shiftConfirmKeyboard(): InlineKeyboardMarkup {
+  return {
+    inline_keyboard: [
+      [
+        { text: "✅ Да, новая смена", callback_data: "adm_shift_go" },
+        { text: "⬅️ Отмена", callback_data: "adm_panel:stats" },
+      ],
+    ],
+  };
+}
+
+export function demandAllKeyboard(): InlineKeyboardMarkup {
+  return {
+    inline_keyboard: [[{ text: "⬅️ Назад", callback_data: "adm_panel:stats" }]],
   };
 }
 
 /**
  * Редактор остатков: одна строка на полевую позицию.
- * [−] [Айс-латте · 5 (🚚 2) ✅] [+]
- * Центральная кнопка — toggle доступности (adm_avail:<slug>).
+ * [−] [Айс-латте · 5 ✅] [+]
+ * Центральная кнопка — toggle доступности (adm_stock:<slug>:toggle).
  */
 export function stockKeyboard(items: MenuItemRow[]): InlineKeyboardMarkup {
   const rows: InlineKeyboardButton[][] = [];
 
   for (const item of items) {
     const status = item.available ? "✅" : "⛔";
-    const label = `${item.title} · ${item.stock_qty} (🚚 ${item.reserved_qty}) ${status}`;
+    const label = `${item.title} · ${item.stock} ${status}`;
     rows.push([
-      { text: "−", callback_data: `adm_stk:${item.slug}:dec` },
-      { text: label, callback_data: `adm_avail:${item.slug}` },
-      { text: "+", callback_data: `adm_stk:${item.slug}:inc` },
+      { text: "−", callback_data: `adm_stock:${item.slug}:dec` },
+      { text: label, callback_data: `adm_stock:${item.slug}:toggle` },
+      { text: "+", callback_data: `adm_stock:${item.slug}:inc` },
     ]);
   }
 
