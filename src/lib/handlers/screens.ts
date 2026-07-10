@@ -12,6 +12,7 @@ import {
   cartKeyboard,
   carKeyboard,
   confirmationKeyboard,
+  historyKeyboard,
   landmarkKeyboard,
   mainMenuKeyboard,
   menuKeyboard,
@@ -20,12 +21,14 @@ import {
   wantConfirmKeyboard,
   wantListKeyboard,
 } from "@/lib/telegram/keyboards";
-import type { CartItem, MenuItemRow, PaymentMethod } from "@/types/database";
+import type { CartItem, MenuItemRow, OrderRow, PaymentMethod } from "@/types/database";
 import { esc } from "@/lib/telegram/escape";
 import {
   cartTotalKop,
   cartTotalQty,
+  formatMoscowDateTime,
   formatRub,
+  orderStatusEmoji,
   paymentLabel,
   renderBulletLines,
   renderCartLines,
@@ -109,7 +112,12 @@ export function buildCart(
     return {
       text: "🛒 Корзина пуста. Загляните в меню!",
       options: {
-        reply_markup: { inline_keyboard: [[{ text: "🧋 Меню", callback_data: "menu" }]] },
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: "🧋 Меню", callback_data: "menu" }],
+            [{ text: "📜 Мои заказы", callback_data: "history" }],
+          ],
+        },
       },
     };
   }
@@ -134,6 +142,39 @@ export function buildWantList(items: MenuItemRow[]): ScreenPayload {
   return {
     text: "👀 <b>Чего сегодня нет:</b>\nНажмите — запишем интерес.",
     options: { reply_markup: wantListKeyboard(unavailable) },
+  };
+}
+
+export function buildHistory(orders: OrderRow[]): ScreenPayload {
+  if (orders.length === 0) {
+    return {
+      text: "📜 Заказов пока не было. Сделайте первый! 🧋",
+      options: {
+        reply_markup: { inline_keyboard: [[{ text: "🧋 Меню", callback_data: "menu" }]] },
+      },
+    };
+  }
+
+  const lines: string[] = ["📜 <b>Ваши последние заказы:</b>"];
+  for (const o of orders) {
+    const date = formatMoscowDateTime(o.created_at);
+    const total = formatRub(o.total_kop);
+    const emoji = orderStatusEmoji(o.status);
+    lines.push("");
+    lines.push(`№${o.order_number} · ${date} · ${total} · ${emoji}`);
+    const itemLines = Array.isArray(o.items) ? o.items : [];
+    for (const it of itemLines) {
+      if (!it || typeof it !== "object") continue;
+      const name = it.variant
+        ? `${esc(it.title)} (${esc(it.variant.toLowerCase())})`
+        : esc(it.title);
+      lines.push(`• ${name} ×${it.qty}`);
+    }
+  }
+
+  return {
+    text: lines.join("\n"),
+    options: { reply_markup: historyKeyboard(orders) },
   };
 }
 

@@ -6,7 +6,7 @@
  * Лимит Telegram — 64 байта. Slug'и позиций короткие (см. миграцию).
  */
 
-import type { CartItem, MenuItemRow, OrderStatus } from "@/types/database";
+import type { CartItem, MenuItemRow, OrderRow, OrderStatus } from "@/types/database";
 import type {
   InlineKeyboardButton,
   InlineKeyboardMarkup,
@@ -172,6 +172,19 @@ export function wantListKeyboard(items: MenuItemRow[]): InlineKeyboardMarkup {
     return [{ text: `${item.title}${suffix}`, callback_data: `want:${item.slug}` }];
   });
   rows.push([{ text: "⬅️ Меню", callback_data: "menu" }]);
+  return { inline_keyboard: rows };
+}
+
+// ============================================================================
+// История заказов
+// ============================================================================
+
+/** Кнопки повтора для экрана «Мои заказы». */
+export function historyKeyboard(orders: OrderRow[]): InlineKeyboardMarkup {
+  const rows: InlineKeyboardButton[][] = orders.map((o) => [
+    { text: `🔁 Повторить №${o.order_number}`, callback_data: `repeat:${o.order_number}` },
+  ]);
+  rows.push([{ text: "⬅️ Назад", callback_data: "cart" }]);
   return { inline_keyboard: rows };
 }
 
@@ -347,6 +360,7 @@ export function aboutKeyboard(
         { text: "📍 На карте", url: mapUrl },
         { text: "🐱 Telegram-группа", url: groupUrl },
       ],
+      [{ text: "📜 Мои заказы", callback_data: "history" }],
       [{ text: "⬅️ Меню", callback_data: "menu" }],
     ],
   };

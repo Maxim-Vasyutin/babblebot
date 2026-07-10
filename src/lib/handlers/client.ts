@@ -11,6 +11,7 @@
 
 import type { TgUpdateT, TgCallbackQueryT } from "@/lib/schemas";
 import { CallbackData } from "@/lib/schemas";
+import { z } from "zod";
 import type {
   CartItem,
   MenuItemRow,
@@ -24,6 +25,8 @@ import {
   getAdminChatId,
   getCurrentShift,
   getMenuItems,
+  getOrderByNumberAndUser,
+  getRecentOrders,
   recordDemandEvent,
   returnStock,
   saveSession,
@@ -47,6 +50,7 @@ import {
   buildCart,
   buildCarPromptNew,
   buildCarPromptRepeat,
+  buildHistory,
   buildLandmarkPrompt,
   buildLandmarkTextPrompt,
   buildMenu,
@@ -63,6 +67,15 @@ import { deleteOldUi, editScreen, replaceScreen } from "./render";
 import { sendOrderCard } from "./admin_card";
 import { updateWaitlistBoard } from "./waitlist";
 import { clientReplyKeyboard } from "@/lib/telegram/keyboards";
+
+// Zod-валидация строки снапшота заказа (Edge Case 10 FEATURE_SPEC_05)
+const SnapshotItemSchema = z.object({
+  slug: z.string(),
+  title: z.string(),
+  variant: z.string().nullable(),
+  price_kop: z.number().int(),
+  qty: z.number().int().positive(),
+});
 
 // ============================================================================
 // Точка входа
@@ -302,6 +315,14 @@ async function handleCallback(
         const newId = await editScreen(chatId, liveMsgId, screen.text, screen.options);
         session.live_message_id = newId;
         await saveSession(session);
+        return;
+      }
+      case "history": {
+        await handleHistory(chatId, session, liveMsgId);
+        return;
+      }
+      case "repeat": {
+        await handleRepeat(chatId, arg1, session, cb.id, liveMsgId);
         return;
       }
       case "cart_clear": {
@@ -956,6 +977,129 @@ async function handlePay(
   }
 
   void paymentLabel;
+}
+
+// ============================================================================
+// История заказов и повтор
+// ============================================================================
+
+async function handleHistory(
+  chatId: number,
+  session: UserSessionRow,
+  liveMsgId: number | null
+): Promise<void> {
+  const orders = await getRecentOrders(session.user_id);
+  const screen = buildHistory(orders);
+  const newId = await editScreen(chatId, liveMsgId, screen.text, screen.options);
+  session.live_message_id = newId;
+  await saveSession(session);
+}
+
+async function handleRepeat(
+  chatId: number,
+  orderNumberStr: string | undefined,
+  session: UserSessionRow,
+  cbId: string,
+  liveMsgId: number | null
+): Promise<void> {
+  const orderNumber = Number(orderNumberStr);
+  if (!Number.isInteger(orderNumber) || orderNumber <= 0) return;
+
+  // 1. Получить заказ (проверка user_id — EC7)
+  const order = await getOrderByNumberAndUser(orderNumber, session.user_id);
+  if (!order) {
+    await answerCallbackQuery(cbId, "Заказ не найден");
+    const orders = await getRecentOrders(session.user_id);
+    const screen = buildHistory(orders);
+    const newId = await editScreen(chatId, liveMsgId, screen.text, screen.options);
+    session.live_message_id = newId;
+    await saveSession(session);
+    return;
+  }
+
+  // 2. Сопоставить снапшот с текущим меню
+  const menuItems = await getMenuItems();
+  const menuBySlug = new Map(menuItems.map((i) => [i.slug, i]));
+
+  const newCart: CartItem[] = [];
+  const dropped: string[] = [];
+  const capped: string[] = [];
+
+  const rawItems = Array.isArray(order.items) ? order.items : [];
+  for (const raw of rawItems) {
+    const parsed = SnapshotItemSchema.safeParse(raw);
+    if (!parsed.success) {
+      console.warn("repeat_invalid_snapshot_item", {
+        order_number: orderNumber,
+        raw: JSON.stringify(raw),
+        err: parsed.error.message,
+      });
+      continue; // EC10: пропускаем сломанную строку
+    }
+    const snap = parsed.data;
+    const current = menuBySlug.get(snap.slug);
+
+    if (!current || !current.available || current.stock === 0) {
+      dropped.push(snap.title);
+      continue;
+    }
+
+    const qty = Math.min(snap.qty, current.stock, MAX_QTY);
+    if (qty < snap.qty) {
+      capped.push(`${snap.title} осталось ${qty}`);
+    }
+
+    newCart.push({
+      slug: current.slug,
+      title: current.title,
+      variant: snap.variant, // вариант из снапшота — EC8
+      price_kop: current.price_kop, // актуальная цена
+      qty,
+    });
+  }
+
+  // 3. Если ничего не осталось — EC1
+  if (newCart.length === 0) {
+    await answerCallbackQuery(cbId, `Из заказа №${orderNumber} сегодня нет ничего 🙈`);
+    const items = await getMenuItems();
+    const screen = buildMenu(items, session.cart);
+    const newId = await editScreen(chatId, liveMsgId, screen.text, screen.options);
+    session.live_message_id = newId;
+    await saveSession(session);
+    return;
+  }
+
+  // 4. Заменить корзину
+  const wasPrevNonEmpty = session.cart.length > 0;
+  session.cart = newCart;
+  session.state = "cart";
+
+  const screen = buildCart(newCart);
+  const newId = await editScreen(chatId, liveMsgId, screen.text, screen.options);
+  session.live_message_id = newId;
+  await saveSession(session);
+
+  // 5. Toast
+  const toast = wasPrevNonEmpty
+    ? `Корзина заменена заказом №${orderNumber}`
+    : `Заказ №${orderNumber} в корзине ✅`;
+  await answerCallbackQuery(cbId, toast);
+
+  // 6. Отдельное сообщение о выброшенных/урезанных позициях — EC2, EC5
+  const notices: string[] = [];
+  if (dropped.length > 0) {
+    notices.push(`${dropped.join(", ")} — закончилось, убрали`);
+  }
+  if (capped.length > 0) {
+    notices.push(...capped);
+  }
+  if (notices.length > 0) {
+    try {
+      await sendMessage(chatId, notices.join(". ") + ".");
+    } catch {
+      // Non-critical
+    }
+  }
 }
 
 // ============================================================================

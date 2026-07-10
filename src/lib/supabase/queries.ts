@@ -290,6 +290,45 @@ export async function getOrderById(orderId: string): Promise<OrderRow | null> {
   return (data as OrderRow | null) ?? null;
 }
 
+/** Последние N заказов клиента для экрана истории. */
+export async function getRecentOrders(
+  userId: number,
+  limit = 3
+): Promise<OrderRow[]> {
+  const { data, error } = await supabase
+    .from("orders")
+    .select("order_number,items,total_kop,status,created_at,id,user_id,username,landmark,car,payment_method,shift_id,admin_message_id,handled_by,updated_at")
+    .eq("user_id", userId)
+    .order("created_at", { ascending: false })
+    .limit(limit);
+
+  if (error) {
+    throw new Error(`getRecentOrders failed: ${error.message}`);
+  }
+  return (data ?? []) as OrderRow[];
+}
+
+/**
+ * Получить заказ по номеру, только если он принадлежит этому userId.
+ * Защита от подделки callback_data (Edge Case 7 FEATURE_SPEC_05).
+ */
+export async function getOrderByNumberAndUser(
+  orderNumber: number,
+  userId: number
+): Promise<OrderRow | null> {
+  const { data, error } = await supabase
+    .from("orders")
+    .select("*")
+    .eq("order_number", orderNumber)
+    .eq("user_id", userId)
+    .maybeSingle();
+
+  if (error) {
+    throw new Error(`getOrderByNumberAndUser failed: ${error.message}`);
+  }
+  return (data as OrderRow | null) ?? null;
+}
+
 // ============================================================================
 // app_settings
 // ============================================================================

@@ -7,7 +7,7 @@
  * - Ярлыки ориентира: «у въезда», «середина очереди», «хвост очереди».
  */
 
-import type { CartItem, PaymentMethod } from "@/types/database";
+import type { CartItem, OrderStatus, PaymentMethod } from "@/types/database";
 import { esc } from "@/lib/telegram/escape";
 
 /** Копейки → «250₽» (integer-математика). */
@@ -95,4 +95,26 @@ export function renderBulletLines(cart: CartItem[]): string {
 export function userTag(username: string | null, userId: number): string {
   if (username && username.length > 0) return `@${esc(username)}`;
   return `id ${userId}`;
+}
+
+/** «9 июля, 18:13» в Moscow time (UTC+3, без DST). */
+export function formatMoscowDateTime(iso: string): string {
+  const msk = new Date(new Date(iso).getTime() + 3 * 60 * 60 * 1000);
+  const months = [
+    "января", "февраля", "марта", "апреля", "мая", "июня",
+    "июля", "августа", "сентября", "октября", "ноября", "декабря",
+  ];
+  const hh = String(msk.getUTCHours()).padStart(2, "0");
+  const mm = String(msk.getUTCMinutes()).padStart(2, "0");
+  return `${msk.getUTCDate()} ${months[msk.getUTCMonth()]}, ${hh}:${mm}`;
+}
+
+/** Emoji статуса заказа. */
+export function orderStatusEmoji(status: OrderStatus): string {
+  switch (status) {
+    case "new":         return "🆕";
+    case "in_progress": return "🚚";
+    case "delivered":   return "✅";
+    case "cancelled":   return "❌";
+  }
 }
