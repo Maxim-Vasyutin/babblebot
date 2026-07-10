@@ -112,7 +112,7 @@ export async function saveSession(session: UserSessionRow): Promise<void> {
       context: session.context,
       cart: session.cart,
       last_car: session.last_car,
-      ui_message_id: session.ui_message_id,
+      live_message_id: session.live_message_id,
     })
     .eq("user_id", session.user_id);
 

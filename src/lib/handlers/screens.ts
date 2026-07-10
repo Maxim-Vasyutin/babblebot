@@ -18,6 +18,7 @@ import {
   paymentKeyboard,
   variantKeyboard,
   wantConfirmKeyboard,
+  wantListKeyboard,
 } from "@/lib/telegram/keyboards";
 import type { CartItem, MenuItemRow, PaymentMethod } from "@/types/database";
 import { esc } from "@/lib/telegram/escape";
@@ -100,7 +101,10 @@ export function buildVariantPrompt(item: MenuItemRow): ScreenPayload | null {
   return null;
 }
 
-export function buildCart(cart: CartItem[]): ScreenPayload {
+export function buildCart(
+  cart: CartItem[],
+  confirmClear = false
+): ScreenPayload {
   if (cart.length === 0) {
     return {
       text: "🛒 Корзина пуста. Загляните в меню!",
@@ -113,9 +117,26 @@ export function buildCart(cart: CartItem[]): ScreenPayload {
   const total = formatRub(cartTotalKop(cart));
   return {
     text: `🛒 <b>Ваш заказ:</b>\n${lines}\n<b>Итого: ${total}</b>`,
-    options: { reply_markup: cartKeyboard(cart) },
+    options: { reply_markup: cartKeyboard(cart, confirmClear) },
   };
 }
+
+export function buildWantList(items: MenuItemRow[]): ScreenPayload {
+  const unavailable = items.filter((i) => !i.available || i.stock === 0);
+  if (unavailable.length === 0) {
+    return {
+      text: "👀 Сейчас всё в наличии! Возвращайтесь в меню 🧋",
+      options: {
+        reply_markup: { inline_keyboard: [[{ text: "🧋 Меню", callback_data: "menu" }]] },
+      },
+    };
+  }
+  return {
+    text: "👀 <b>Чего сегодня нет:</b>\nНажмите — запишем интерес.",
+    options: { reply_markup: wantListKeyboard(unavailable) },
+  };
+}
+
 
 export function buildLandmarkPrompt(): ScreenPayload {
   return {

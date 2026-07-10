@@ -6,6 +6,7 @@
  */
 
 import { editMessageText, sendMessage, answerCallbackQuery } from "@/lib/telegram/api";
+import { esc } from "@/lib/telegram/escape";
 import {
   getAllTimeDemand,
   getCurrentShift,
@@ -57,9 +58,16 @@ async function renderHome(chatId: number, msgId?: number): Promise<void> {
 async function renderStock(chatId: number, msgId?: number): Promise<void> {
   const [items, shift] = await Promise.all([getMenuItems(), getCurrentShift()]);
   const shiftDate = shift ? moscowDateFromIso(shift.started_at) : "нет смены";
-  const text =
-    `📦 <b>Остатки</b> · смена от ${shiftDate}\n` +
-    "[+]/[−] — остаток · центральная кнопка — стоп/старт";
+  const lines = [
+    `📦 <b>Остатки</b> · смена от ${shiftDate}`,
+    "[+]/[−] — остаток · ✅/⛔ — снять или вернуть в продажу",
+    "",
+  ];
+  items.forEach((it, idx) => {
+    const status = it.available ? "✅" : "⛔";
+    lines.push(`${idx + 1}. ${esc(it.title)} — ${it.stock} ${status}`);
+  });
+  const text = lines.join("\n");
   if (msgId) {
     await editMessageText(chatId, msgId, text, { reply_markup: stockKeyboard(items) });
   } else {
@@ -233,6 +241,11 @@ export async function openAdminPanel(chatId: number): Promise<void> {
 /** /стоп — открыть сразу редактор остатков (новое сообщение). */
 export async function openStockEditor(chatId: number): Promise<void> {
   await renderStock(chatId, undefined);
+}
+
+/** 🔄 Новая смена (из reply-кнопки) — открыть подтверждение смены (новое сообщение). */
+export async function openShiftConfirm(chatId: number): Promise<void> {
+  await renderShiftConfirm(chatId, undefined);
 }
 
 /** adm_panel:home/stock/stats — переключить экран (edit на месте). */

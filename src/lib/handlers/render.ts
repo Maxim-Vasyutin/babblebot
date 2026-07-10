@@ -1,11 +1,11 @@
 /**
- * renderScreen — единая точка доставки всех клиентских UI-экранов.
+ * Функции доставки UI-экранов.
  *
- * Логика (FEATURE_SPEC_02):
- * 1. Если есть uiMsgId → editMessageText; "not modified" игнорируем.
- * 2. Прочие ошибки edit → deleteMessage best-effort → sendMessage нового.
- * 3. Нет uiMsgId → sendMessage.
- * Возвращает message_id актуального UI-сообщения (сохранять в session.ui_message_id).
+ * editScreen  — для inline-кнопок: редактирует сообщение на месте.
+ *               «not modified» проглатывает. При ошибке отправляет новое.
+ * replaceScreen — для reply-кнопок и текстового ввода: удаляет старое сообщение
+ *               (best-effort) и шлёт новое ниже.
+ * deleteOldUi — best-effort удаление сообщения по id.
  */
 
 import { deleteMessage, editMessageText, sendMessage } from "@/lib/telegram/api";
@@ -13,44 +13,56 @@ import type { SendMessageOptions } from "@/lib/telegram/api";
 
 export async function deleteOldUi(
   chatId: number,
-  uiMsgId: number | null | undefined
+  liveMsgId: number | null | undefined
 ): Promise<void> {
-  if (!uiMsgId) return;
+  if (!liveMsgId) return;
   try {
-    await deleteMessage(chatId, uiMsgId);
+    await deleteMessage(chatId, liveMsgId);
   } catch (err) {
     console.warn("delete_old_ui_failed", {
       chat_id: chatId,
-      msg_id: uiMsgId,
+      msg_id: liveMsgId,
       err: String(err),
     });
   }
 }
 
-export async function renderScreen(
+/** Inline-кнопка: редактировать сообщение на месте. */
+export async function editScreen(
   chatId: number,
-  uiMsgId: number | null | undefined,
+  liveMsgId: number | null | undefined,
   text: string,
   options: SendMessageOptions = {}
 ): Promise<number> {
-  if (uiMsgId) {
+  if (liveMsgId) {
     try {
-      await editMessageText(chatId, uiMsgId, text, options);
-      return uiMsgId;
+      await editMessageText(chatId, liveMsgId, text, options);
+      return liveMsgId;
     } catch (err) {
       const desc = String(err);
       if (desc.includes("message is not modified")) {
-        return uiMsgId;
+        return liveMsgId;
       }
-      // Сообщение удалено или старше 48 ч — отправляем новое.
-      console.warn("render_screen_edit_failed", {
+      console.warn("edit_screen_failed", {
         chat_id: chatId,
-        msg_id: uiMsgId,
+        msg_id: liveMsgId,
         err: desc,
       });
-      await deleteOldUi(chatId, uiMsgId);
+      // Сообщение удалено или старше 48 ч — отправляем новое.
     }
   }
+  const result = await sendMessage(chatId, text, options);
+  return result.message_id;
+}
+
+/** Reply-кнопка / текстовый ввод: удалить старое, прислать новое ниже. */
+export async function replaceScreen(
+  chatId: number,
+  liveMsgId: number | null | undefined,
+  text: string,
+  options: SendMessageOptions = {}
+): Promise<number> {
+  await deleteOldUi(chatId, liveMsgId);
   const result = await sendMessage(chatId, text, options);
   return result.message_id;
 }

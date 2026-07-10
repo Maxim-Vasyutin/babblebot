@@ -17,6 +17,7 @@ export type SessionState =
   | 'browsing'
   | 'choosing_variant'
   | 'cart'
+  | 'cart_confirm_clear'
   | 'checkout_landmark'
   | 'checkout_landmark_text'
   | 'checkout_car'
@@ -79,7 +80,7 @@ export type UserSessionRow = {
   context: Record<string, unknown>;
   cart: CartItem[];
   last_car: string | null;
-  ui_message_id: number | null;
+  live_message_id: number | null;
   created_at: string;
   updated_at: string;
 };

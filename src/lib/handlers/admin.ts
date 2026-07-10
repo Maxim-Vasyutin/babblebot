@@ -44,8 +44,10 @@ import {
   handleAdmStkCb,
   handleAdmStockCb,
   openAdminPanel,
+  openShiftConfirm,
   openStockEditor,
 } from "./adminPanel";
+import { adminReplyKeyboard } from "@/lib/telegram/keyboards";
 
 // ============================================================================
 // Точка входа
@@ -95,7 +97,7 @@ async function handleAdminMessage(
     return;
   }
 
-  if (text === "/стоп" || text === "/stop") {
+  if (text === "📦 Остатки" || text === "/стоп" || text === "/stop") {
     try {
       await openStockEditor(chatId);
     } catch (err) {
@@ -105,8 +107,18 @@ async function handleAdminMessage(
     return;
   }
 
-  if (text === "/стат" || text === "/stat") {
+  if (text === "📊 Статистика" || text === "/стат" || text === "/stat") {
     await handleStat(chatId);
+    return;
+  }
+
+  if (text === "🔄 Новая смена") {
+    try {
+      await openShiftConfirm(chatId);
+    } catch (err) {
+      console.error("admin_shift_confirm_failed", { err: String(err) });
+      try { await sendMessage(chatId, "⚠️ Не удалось открыть экран смены."); } catch { /* ignore */ }
+    }
     return;
   }
 }
@@ -146,7 +158,9 @@ async function handleInit(
       { key: "admin_bound_by", value: String(fromId) },
       { onConflict: "key" }
     );
-    await sendMessage(chatId, "✅ Этот чат — рабочий.");
+    await sendMessage(chatId, "✅ Этот чат — рабочий.", {
+      reply_markup: adminReplyKeyboard(),
+    });
   } catch (err) {
     console.error("admin_init_failed", { chat_id: chatId, err: String(err) });
     try { await sendMessage(chatId, "⚠️ Не удалось привязать чат. Повторите."); } catch { /* ignore */ }

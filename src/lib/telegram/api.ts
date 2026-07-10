@@ -26,7 +26,16 @@ export type InlineKeyboardMarkup = {
   inline_keyboard: InlineKeyboardButton[][];
 };
 
-export type ReplyMarkup = InlineKeyboardMarkup;
+export type ReplyKeyboardButton = { text: string };
+
+export type ReplyKeyboardMarkup = {
+  keyboard: ReplyKeyboardButton[][];
+  resize_keyboard?: boolean;
+  is_persistent?: boolean;
+  one_time_keyboard?: boolean;
+};
+
+export type ReplyMarkup = InlineKeyboardMarkup | ReplyKeyboardMarkup;
 
 export type SendMessageOptions = {
   reply_markup?: ReplyMarkup;

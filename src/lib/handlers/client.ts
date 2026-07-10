@@ -1,10 +1,10 @@
 /**
  * Клиентский поток (private chat).
  *
- * v1.1: единственный UI-экран на клиента. renderScreen редактирует или шлёт новое.
- * ui_message_id для callback берётся из cb.message (self-recovery при рассинхроне).
- * Для текстового ввода: deleteOldUi → sendMessage → обновить id.
- * Для pay:* : deleteOldUi (экран оплаты) → sendOrderConfirmation → ui_message_id = null.
+ * v1.2: live_message_id — единственный экран-сообщение в чате клиента.
+ *   Inline-кнопки → editScreen (редактирует на месте).
+ *   Reply-кнопки / текстовый ввод → replaceScreen (удаляет старое, шлёт новое).
+ *   Чек заказа — отдельное сообщение, live_message_id обнуляется.
  *
  * Инвариант: корзина/state пишутся в БД ДО отправки в Telegram.
  */
@@ -53,14 +53,16 @@ import {
   buildPaymentPrompt,
   buildSoftHint,
   buildVariantPrompt,
+  buildWantList,
   buildWelcome,
   sendError,
   sendOrderConfirmation,
   sendWantAck,
 } from "./screens";
-import { deleteOldUi, renderScreen } from "./render";
+import { deleteOldUi, editScreen, replaceScreen } from "./render";
 import { sendOrderCard } from "./admin_card";
 import { updateWaitlistBoard } from "./waitlist";
+import { clientReplyKeyboard } from "@/lib/telegram/keyboards";
 
 // ============================================================================
 // Точка входа
@@ -92,16 +94,29 @@ async function handleMessage(
   const chatId = msg.chat.id;
   const text = msg.text?.trim() ?? "";
 
+  // FSM-состояния текстового ввода проверяются ДО роутинга reply-кнопок:
+  // клиент не должен случайно назвать машину «🧋 Меню» и выйти из checkout.
+  if (session.state === "checkout_car") {
+    await handleCarInput(chatId, text, session);
+    return;
+  }
+
+  if (session.state === "checkout_landmark_text") {
+    await handleLandmarkTextInput(chatId, text, session);
+    return;
+  }
+
+  // /start: всегда сбрасывает сессию и присылает reply-панель.
   if (text === "/start") {
-    const oldUiMsgId = session.ui_message_id;
+    const oldLiveId = session.live_message_id;
     session.state = "browsing";
     session.cart = [];
     session.context = {};
+    session.live_message_id = null;
     try {
-      await deleteOldUi(chatId, oldUiMsgId);
-      const screen = buildWelcome();
-      const result = await sendMessage(chatId, screen.text, screen.options);
-      session.ui_message_id = result.message_id;
+      await deleteOldUi(chatId, oldLiveId);
+      const { text: welcomeText } = buildWelcome();
+      await sendMessage(chatId, welcomeText, { reply_markup: clientReplyKeyboard() });
       await saveSession(session);
     } catch (err) {
       console.error("client_start_failed", { user_id: session.user_id, err: String(err) });
@@ -110,14 +125,13 @@ async function handleMessage(
     return;
   }
 
-  if (text === "/menu") {
+  // Reply-кнопки и команды навигации.
+  if (text === "🧋 Меню" || text === "/menu") {
     try {
-      const oldUiMsgId = session.ui_message_id;
-      await deleteOldUi(chatId, oldUiMsgId);
       const items = await getMenuItems();
       const screen = buildMenu(items, session.cart);
-      const result = await sendMessage(chatId, screen.text, screen.options);
-      session.ui_message_id = result.message_id;
+      const newId = await replaceScreen(chatId, session.live_message_id, screen.text, screen.options);
+      session.live_message_id = newId;
       await saveSession(session);
     } catch (err) {
       console.error("client_menu_failed", { user_id: session.user_id, err: String(err) });
@@ -126,13 +140,44 @@ async function handleMessage(
     return;
   }
 
-  if (session.state === "checkout_car") {
-    await handleCarInput(chatId, text, session);
+  if (text === "🛒 Корзина") {
+    try {
+      const confirmClear = session.state === "cart_confirm_clear";
+      const screen = buildCart(session.cart, confirmClear);
+      const newId = await replaceScreen(chatId, session.live_message_id, screen.text, screen.options);
+      session.live_message_id = newId;
+      await saveSession(session);
+    } catch (err) {
+      console.error("client_cart_text_failed", { user_id: session.user_id, err: String(err) });
+      await safeError(chatId);
+    }
     return;
   }
 
-  if (session.state === "checkout_landmark_text") {
-    await handleLandmarkTextInput(chatId, text, session);
+  if (text === "👀 Хочется попробовать") {
+    try {
+      const items = await getMenuItems();
+      const screen = buildWantList(items);
+      const newId = await replaceScreen(chatId, session.live_message_id, screen.text, screen.options);
+      session.live_message_id = newId;
+      await saveSession(session);
+    } catch (err) {
+      console.error("client_want_list_failed", { user_id: session.user_id, err: String(err) });
+      await safeError(chatId);
+    }
+    return;
+  }
+
+  if (text === "ℹ️ О нас") {
+    try {
+      const screen = buildAbout();
+      const newId = await replaceScreen(chatId, session.live_message_id, screen.text, screen.options);
+      session.live_message_id = newId;
+      await saveSession(session);
+    } catch (err) {
+      console.error("client_about_text_failed", { user_id: session.user_id, err: String(err) });
+      await safeError(chatId);
+    }
     return;
   }
 
@@ -157,10 +202,9 @@ async function handleCarInput(
   session.last_car = car;
   session.state = "checkout_payment";
   try {
-    await deleteOldUi(chatId, session.ui_message_id);
     const screen = buildPaymentPrompt();
-    const result = await sendMessage(chatId, screen.text, screen.options);
-    session.ui_message_id = result.message_id;
+    const newId = await replaceScreen(chatId, session.live_message_id, screen.text, screen.options);
+    session.live_message_id = newId;
     await saveSession(session);
   } catch (err) {
     console.error("client_car_input_failed", { user_id: session.user_id, err: String(err) });
@@ -184,8 +228,13 @@ async function handleLandmarkTextInput(
   }
   session.context = { ...session.context, landmark };
   try {
-    await deleteOldUi(chatId, session.ui_message_id);
-    await afterLandmarkChosen(chatId, session, null);
+    session.state = "checkout_car";
+    const screen = session.last_car
+      ? buildCarPromptRepeat(session.last_car)
+      : buildCarPromptNew();
+    const newId = await replaceScreen(chatId, session.live_message_id, screen.text, screen.options);
+    session.live_message_id = newId;
+    await saveSession(session);
   } catch (err) {
     console.error("client_landmark_text_failed", { user_id: session.user_id, err: String(err) });
     await safeError(chatId);
@@ -203,8 +252,8 @@ async function handleCallback(
   const chatId = cb.message?.chat.id;
   if (!chatId) return;
 
-  // Берём message_id из callback-сообщения — self-recovery при рассинхроне ui_message_id.
-  const uiMsgId = cb.message?.message_id ?? null;
+  // live_message_id из callback-сообщения — self-recovery при рассинхроне.
+  const liveMsgId = cb.message?.message_id ?? null;
 
   const raw = cb.data ?? "";
   const parsed = CallbackData.safeParse(raw);
@@ -219,50 +268,85 @@ async function handleCallback(
 
   try {
     switch (action) {
+      case "noop": {
+        await answerCallbackQuery(cb.id);
+        return;
+      }
       case "menu": {
+        if (session.state === "cart_confirm_clear") session.state = "cart";
         const items = await getMenuItems();
         const screen = buildMenu(items, session.cart);
-        const newId = await renderScreen(chatId, uiMsgId, screen.text, screen.options);
-        session.ui_message_id = newId;
+        const newId = await editScreen(chatId, liveMsgId, screen.text, screen.options);
+        session.live_message_id = newId;
         await saveSession(session);
         return;
       }
       case "cart": {
+        if (session.state === "cart_confirm_clear") session.state = "cart";
         const screen = buildCart(session.cart);
-        const newId = await renderScreen(chatId, uiMsgId, screen.text, screen.options);
-        session.ui_message_id = newId;
+        const newId = await editScreen(chatId, liveMsgId, screen.text, screen.options);
+        session.live_message_id = newId;
         await saveSession(session);
         return;
       }
       case "about": {
         const screen = buildAbout();
-        const newId = await renderScreen(chatId, uiMsgId, screen.text, screen.options);
-        session.ui_message_id = newId;
+        const newId = await editScreen(chatId, liveMsgId, screen.text, screen.options);
+        session.live_message_id = newId;
+        await saveSession(session);
+        return;
+      }
+      case "want_list": {
+        const items = await getMenuItems();
+        const screen = buildWantList(items);
+        const newId = await editScreen(chatId, liveMsgId, screen.text, screen.options);
+        session.live_message_id = newId;
+        await saveSession(session);
+        return;
+      }
+      case "cart_clear": {
+        session.state = "cart_confirm_clear";
+        const screen = buildCart(session.cart, true);
+        const newId = await editScreen(chatId, liveMsgId, screen.text, screen.options);
+        session.live_message_id = newId;
+        await saveSession(session);
+        return;
+      }
+      case "cart_clear_go": {
+        // Edge Case 6: idempotent — если корзина уже пуста, просто показываем её.
+        session.cart = [];
+        session.state = "browsing";
+        const screen = buildCart(session.cart);
+        const newId = await editScreen(chatId, liveMsgId, screen.text, screen.options);
+        session.live_message_id = newId;
         await saveSession(session);
         return;
       }
       case "item": {
-        await handleItemTap(chatId, arg1, session, cb.id, uiMsgId);
+        await handleItemTap(chatId, arg1, session, cb.id, liveMsgId);
         return;
       }
       case "var": {
-        await handleVariantTap(chatId, arg1, arg2, session, cb.id, uiMsgId);
+        await handleVariantTap(chatId, arg1, arg2, session, cb.id, liveMsgId);
         return;
       }
       case "add": {
-        await handleAddTap(chatId, arg1, session, cb.id, uiMsgId);
+        await handleAddTap(chatId, arg1, session, cb.id, liveMsgId);
         return;
       }
       case "inc": {
-        await handleIncDec(chatId, arg1, session, "inc", cb.id, uiMsgId);
+        if (session.state === "cart_confirm_clear") session.state = "cart";
+        await handleIncDec(chatId, arg1, session, "inc", cb.id, liveMsgId);
         return;
       }
       case "dec": {
-        await handleIncDec(chatId, arg1, session, "dec", cb.id, uiMsgId);
+        if (session.state === "cart_confirm_clear") session.state = "cart";
+        await handleIncDec(chatId, arg1, session, "dec", cb.id, liveMsgId);
         return;
       }
       case "del": {
-        await handleDel(chatId, arg1, session, cb.id, uiMsgId);
+        // Backward compat: [✖] кнопка из старых сообщений.
+        await handleDel(chatId, arg1, session, cb.id, liveMsgId);
         return;
       }
       case "want": {
@@ -270,23 +354,24 @@ async function handleCallback(
         return;
       }
       case "checkout": {
-        await handleCheckout(chatId, session, cb.id, uiMsgId);
+        if (session.state === "cart_confirm_clear") session.state = "cart";
+        await handleCheckout(chatId, session, cb.id, liveMsgId);
         return;
       }
       case "lm": {
-        await handleLandmark(chatId, arg1, session, uiMsgId);
+        await handleLandmark(chatId, arg1, session, liveMsgId);
         return;
       }
       case "car_same": {
-        await handleCarSame(chatId, session, cb.id, uiMsgId);
+        await handleCarSame(chatId, session, cb.id, liveMsgId);
         return;
       }
       case "car_new": {
-        await handleCarNew(chatId, session, uiMsgId);
+        await handleCarNew(chatId, session, liveMsgId);
         return;
       }
       case "pay": {
-        await handlePay(chatId, arg1, session, cb, uiMsgId);
+        await handlePay(chatId, arg1, session, cb, liveMsgId);
         return;
       }
       case "adm_status":
@@ -294,7 +379,7 @@ async function handleCallback(
       case "adm_panel":
       case "adm_stk":
       case "adm_avail": {
-        // Admin callbacks из приватного чата — игнор (#13).
+        // Admin callbacks из приватного чата — игнор.
         return;
       }
       default:
@@ -323,7 +408,7 @@ async function handleItemTap(
   slug: string | undefined,
   session: UserSessionRow,
   cbId: string,
-  uiMsgId: number | null
+  liveMsgId: number | null
 ): Promise<void> {
   if (!slug) return;
   const items = await getMenuItems();
@@ -338,8 +423,8 @@ async function handleItemTap(
     if (!screen) return;
     session.state = "choosing_variant";
     session.context = { ...session.context, slug };
-    const newId = await renderScreen(chatId, uiMsgId, screen.text, screen.options);
-    session.ui_message_id = newId;
+    const newId = await editScreen(chatId, liveMsgId, screen.text, screen.options);
+    session.live_message_id = newId;
     await saveSession(session);
     return;
   }
@@ -352,8 +437,8 @@ async function handleItemTap(
   session.state = "browsing";
   await answerCallbackQuery(cbId, `${item.title} добавлен ✅`);
   const screen = buildMenu(items, session.cart);
-  const newId = await renderScreen(chatId, uiMsgId, screen.text, screen.options);
-  session.ui_message_id = newId;
+  const newId = await editScreen(chatId, liveMsgId, screen.text, screen.options);
+  session.live_message_id = newId;
   await saveSession(session);
 }
 
@@ -363,7 +448,7 @@ async function handleVariantTap(
   variantCode: string | undefined,
   session: UserSessionRow,
   cbId: string,
-  uiMsgId: number | null
+  liveMsgId: number | null
 ): Promise<void> {
   if (!slug || !variantCode) return;
   const items = await getMenuItems();
@@ -375,12 +460,11 @@ async function handleVariantTap(
   }
   const variantLabel = variantCodeToLabel(variantCode);
   if (!variantLabel) {
-    // Unknown/old variant code — show toast and re-render the variant picker.
     await answerCallbackQuery(cbId, "Меню обновилось — выбери снова 🙂");
     const screen = buildVariantPrompt(item);
     if (screen) {
-      const newId = await renderScreen(chatId, uiMsgId, screen.text, screen.options);
-      session.ui_message_id = newId;
+      const newId = await editScreen(chatId, liveMsgId, screen.text, screen.options);
+      session.live_message_id = newId;
       await saveSession(session);
     }
     return;
@@ -394,17 +478,15 @@ async function handleVariantTap(
   session.cart = cart;
   session.state = "browsing";
   session.context = {};
-  const toastText = `${item.title} (${variantLabel.toLowerCase()}) добавлен ✅`;
-  await answerCallbackQuery(cbId, toastText);
+  await answerCallbackQuery(cbId, `${item.title} (${variantLabel.toLowerCase()}) добавлен ✅`);
   const screen = buildMenu(items, session.cart);
-  const newId = await renderScreen(chatId, uiMsgId, screen.text, screen.options);
-  session.ui_message_id = newId;
+  const newId = await editScreen(chatId, liveMsgId, screen.text, screen.options);
+  session.live_message_id = newId;
   await saveSession(session);
 }
 
 function variantCodeToLabel(code: string): string | null {
   switch (code) {
-    // Syrups (v1.1)
     case "s_none":
       return "Без сиропа";
     case "s_caramel":
@@ -413,12 +495,10 @@ function variantCodeToLabel(code: string): string | null {
       return "Кокос";
     case "s_vanilla":
       return "Ваниль";
-    // Tea
     case "tea_green":
       return "Зелёный с гуавой";
     case "tea_black":
       return "Чёрный с абрикосом";
-    // Legacy syrup codes — return null to trigger graceful fallback
     default:
       return null;
   }
@@ -429,7 +509,7 @@ async function handleAddTap(
   slug: string | undefined,
   session: UserSessionRow,
   cbId: string,
-  uiMsgId: number | null
+  liveMsgId: number | null
 ): Promise<void> {
   if (!slug) return;
   const items = await getMenuItems();
@@ -447,8 +527,8 @@ async function handleAddTap(
   session.state = "browsing";
   await answerCallbackQuery(cbId, `${item.title} добавлен ✅`);
   const screen = buildMenu(items, session.cart);
-  const newId = await renderScreen(chatId, uiMsgId, screen.text, screen.options);
-  session.ui_message_id = newId;
+  const newId = await editScreen(chatId, liveMsgId, screen.text, screen.options);
+  session.live_message_id = newId;
   await saveSession(session);
 }
 
@@ -462,7 +542,7 @@ async function handleIncDec(
   session: UserSessionRow,
   op: "inc" | "dec",
   cbId: string,
-  uiMsgId: number | null
+  liveMsgId: number | null
 ): Promise<void> {
   const idx = Number(idxStr);
   if (!Number.isInteger(idx) || idx < 0) return;
@@ -472,8 +552,8 @@ async function handleIncDec(
   if (res.notFound) {
     await answerCallbackQuery(cbId, "Корзина изменилась");
     const screen = buildCart(session.cart);
-    const newId = await renderScreen(chatId, uiMsgId, screen.text, screen.options);
-    session.ui_message_id = newId;
+    const newId = await editScreen(chatId, liveMsgId, screen.text, screen.options);
+    session.live_message_id = newId;
     await saveSession(session);
     return;
   }
@@ -483,8 +563,8 @@ async function handleIncDec(
   }
   session.cart = res.cart;
   const screen = buildCart(session.cart);
-  const newId = await renderScreen(chatId, uiMsgId, screen.text, screen.options);
-  session.ui_message_id = newId;
+  const newId = await editScreen(chatId, liveMsgId, screen.text, screen.options);
+  session.live_message_id = newId;
   await saveSession(session);
 }
 
@@ -493,15 +573,15 @@ async function handleDel(
   idxStr: string | undefined,
   session: UserSessionRow,
   cbId: string,
-  uiMsgId: number | null
+  liveMsgId: number | null
 ): Promise<void> {
   if (!idxStr) return;
   const idx = Number(idxStr);
   if (!Number.isInteger(idx) || idx < 0 || idx >= session.cart.length) {
     await answerCallbackQuery(cbId, "Корзина изменилась");
     const screen = buildCart(session.cart);
-    const newId = await renderScreen(chatId, uiMsgId, screen.text, screen.options);
-    session.ui_message_id = newId;
+    const newId = await editScreen(chatId, liveMsgId, screen.text, screen.options);
+    session.live_message_id = newId;
     await saveSession(session);
     return;
   }
@@ -509,8 +589,8 @@ async function handleDel(
   newCart.splice(idx, 1);
   session.cart = newCart;
   const screen = buildCart(session.cart);
-  const newId = await renderScreen(chatId, uiMsgId, screen.text, screen.options);
-  session.ui_message_id = newId;
+  const newId = await editScreen(chatId, liveMsgId, screen.text, screen.options);
+  session.live_message_id = newId;
   await saveSession(session);
 }
 
@@ -528,7 +608,6 @@ async function handleWant(
   const items = await getMenuItems();
   const item = items.find((i) => i.slug === slug);
   const title = item?.title ?? slug;
-  // sold_out — позиция есть в каталоге, но stock = 0; unavailable — снята или не в каталоге
   const reason = (item && item.stock === 0) ? "sold_out" as const : "unavailable" as const;
 
   await recordDemandEvent(slug, title, fromUserId, reason);
@@ -571,7 +650,7 @@ async function handleCheckout(
   chatId: number,
   session: UserSessionRow,
   cbId: string,
-  uiMsgId: number | null
+  liveMsgId: number | null
 ): Promise<void> {
   if (session.cart.length === 0) {
     await answerCallbackQuery(cbId, "Корзина пуста");
@@ -583,16 +662,16 @@ async function handleCheckout(
     session.cart = cart;
     await answerCallbackQuery(cbId, "Часть позиций закончилась — корзину обновили 🛒");
     const screen = buildCart(cart);
-    const newId = await renderScreen(chatId, uiMsgId, screen.text, screen.options);
-    session.ui_message_id = newId;
+    const newId = await editScreen(chatId, liveMsgId, screen.text, screen.options);
+    session.live_message_id = newId;
     await saveSession(session);
     return;
   }
   session.state = "checkout_landmark";
   session.context = {};
   const screen = buildLandmarkPrompt();
-  const newId = await renderScreen(chatId, uiMsgId, screen.text, screen.options);
-  session.ui_message_id = newId;
+  const newId = await editScreen(chatId, liveMsgId, screen.text, screen.options);
+  session.live_message_id = newId;
   await saveSession(session);
 }
 
@@ -600,37 +679,26 @@ async function handleLandmark(
   chatId: number,
   code: string | undefined,
   session: UserSessionRow,
-  uiMsgId: number | null
+  liveMsgId: number | null
 ): Promise<void> {
   if (!code) return;
   if (code === "text") {
     session.state = "checkout_landmark_text";
     const screen = buildLandmarkTextPrompt();
-    const newId = await renderScreen(chatId, uiMsgId, screen.text, screen.options);
-    session.ui_message_id = newId;
+    const newId = await editScreen(chatId, liveMsgId, screen.text, screen.options);
+    session.live_message_id = newId;
     await saveSession(session);
     return;
   }
   if (code !== "entry" && code !== "middle" && code !== "tail") return;
   const landmark = landmarkLabel(code);
   session.context = { ...session.context, landmark };
-  await afterLandmarkChosen(chatId, session, uiMsgId);
-}
-
-async function afterLandmarkChosen(
-  chatId: number,
-  session: UserSessionRow,
-  uiMsgId: number | null
-): Promise<void> {
   session.state = "checkout_car";
-  let screen;
-  if (session.last_car && session.last_car.length > 0) {
-    screen = buildCarPromptRepeat(session.last_car);
-  } else {
-    screen = buildCarPromptNew();
-  }
-  const newId = await renderScreen(chatId, uiMsgId, screen.text, screen.options);
-  session.ui_message_id = newId;
+  const screen = session.last_car
+    ? buildCarPromptRepeat(session.last_car)
+    : buildCarPromptNew();
+  const newId = await editScreen(chatId, liveMsgId, screen.text, screen.options);
+  session.live_message_id = newId;
   await saveSession(session);
 }
 
@@ -638,39 +706,39 @@ async function handleCarSame(
   chatId: number,
   session: UserSessionRow,
   cbId: string,
-  uiMsgId: number | null
+  liveMsgId: number | null
 ): Promise<void> {
   if (!session.last_car) {
     await answerCallbackQuery(cbId, "Нет прошлой машины, напишите текстом");
     session.state = "checkout_car";
     const screen = buildCarPromptNew();
-    const newId = await renderScreen(chatId, uiMsgId, screen.text, screen.options);
-    session.ui_message_id = newId;
+    const newId = await editScreen(chatId, liveMsgId, screen.text, screen.options);
+    session.live_message_id = newId;
     await saveSession(session);
     return;
   }
   session.context = { ...session.context, car: session.last_car };
   session.state = "checkout_payment";
   const screen = buildPaymentPrompt();
-  const newId = await renderScreen(chatId, uiMsgId, screen.text, screen.options);
-  session.ui_message_id = newId;
+  const newId = await editScreen(chatId, liveMsgId, screen.text, screen.options);
+  session.live_message_id = newId;
   await saveSession(session);
 }
 
 async function handleCarNew(
   chatId: number,
   session: UserSessionRow,
-  uiMsgId: number | null
+  liveMsgId: number | null
 ): Promise<void> {
   session.state = "checkout_car";
   const screen = buildCarPromptNew();
-  const newId = await renderScreen(chatId, uiMsgId, screen.text, screen.options);
-  session.ui_message_id = newId;
+  const newId = await editScreen(chatId, liveMsgId, screen.text, screen.options);
+  session.live_message_id = newId;
   await saveSession(session);
 }
 
 // ============================================================================
-// Оплата → резервация → создание заказа
+// Оплата → декремент стока → создание заказа
 // ============================================================================
 
 async function handlePay(
@@ -678,7 +746,7 @@ async function handlePay(
   method: string | undefined,
   session: UserSessionRow,
   cb: TgCallbackQueryT,
-  uiMsgId: number | null
+  liveMsgId: number | null
 ): Promise<void> {
   const cbId = cb.id;
   if (session.state !== "checkout_payment") {
@@ -701,13 +769,13 @@ async function handlePay(
     });
     session.state = "browsing";
     session.context = {};
-    session.ui_message_id = null;
+    session.live_message_id = null;
     await saveSession(session);
     await sendMessage(chatId, "Что-то потерялось. Начнём заново с меню.");
     return;
   }
 
-  // 1. Проверить наличие открытой смены (Edge Case 5)
+  // 1. Проверить наличие открытой смены
   let currentShift;
   try {
     currentShift = await getCurrentShift();
@@ -725,18 +793,17 @@ async function handlePay(
     return;
   }
 
-  // 2. Отфильтровать недоступные позиции (available=false или stock=0)
+  // 2. Отфильтровать недоступные позиции
   const items = await getMenuItems();
   const { cart: filteredCart, dropped } = filterAvailable(cart, items);
 
   if (dropped.length > 0 && filteredCart.length === 0) {
-    // Edge Case 3: корзина опустела — заказ не создаём
     session.state = "browsing";
     session.cart = [];
     session.context = {};
-    session.ui_message_id = null;
+    session.live_message_id = null;
     await saveSession(session);
-    await deleteOldUi(chatId, uiMsgId);
+    await deleteOldUi(chatId, liveMsgId);
     await sendMessage(
       chatId,
       "Всё из вашего заказа разобрали 🙈\nВыберите что-то другое!",
@@ -746,37 +813,34 @@ async function handlePay(
   }
 
   if (dropped.length > 0) {
-    // Edge Case 2: часть позиций снята — обновляем корзину, возвращаем на cart
     session.cart = filteredCart;
     session.state = "cart";
     await answerCallbackQuery(cbId, "Часть позиций закончилась — корзину обновили 🛒");
     const screen = buildCart(filteredCart);
-    const newId = await renderScreen(chatId, uiMsgId, screen.text, screen.options);
-    session.ui_message_id = newId;
+    const newId = await editScreen(chatId, liveMsgId, screen.text, screen.options);
+    session.live_message_id = newId;
     await saveSession(session);
     return;
   }
 
-  // 3. Атомарное списание (Edge Case 1: гонка за последнюю штуку)
+  // 3. Атомарное списание
   try {
     await decrementStock(filteredCart);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     if (msg.includes("insufficient_stock:")) {
-      // Парсим, каких slug не хватило
       const failedSlugs = new Set(
         msg.replace(/^.*insufficient_stock:/, "").split(",").map((s) => s.trim())
       );
       const corrected = filteredCart.filter((it) => !failedSlugs.has(it.slug));
 
       if (corrected.length === 0) {
-        // Edge Case 3: всё разобрали
         session.state = "browsing";
         session.cart = [];
         session.context = {};
-        session.ui_message_id = null;
+        session.live_message_id = null;
         await saveSession(session);
-        await deleteOldUi(chatId, uiMsgId);
+        await deleteOldUi(chatId, liveMsgId);
         await sendMessage(
           chatId,
           "Всё из вашего заказа разобрали 🙈\nВыберите что-то другое!",
@@ -796,8 +860,8 @@ async function handlePay(
         `${failedTitles} разобрали — убрали из заказа. Оформить остальное?`
       );
       const screen = buildCart(corrected);
-      const newId = await renderScreen(chatId, uiMsgId, screen.text, screen.options);
-      session.ui_message_id = newId;
+      const newId = await editScreen(chatId, liveMsgId, screen.text, screen.options);
+      session.live_message_id = newId;
       await saveSession(session);
       return;
     }
@@ -810,14 +874,15 @@ async function handlePay(
   const snapshotCart = filteredCart.slice();
 
   // КРИТИЧНО: сбрасываем state ДО отправки в Telegram (защита от двойного заказа).
+  // live_message_id = null: чек терминален, никогда не редактируется.
   session.state = "browsing";
   session.cart = [];
   session.context = {};
-  session.ui_message_id = null;
+  session.live_message_id = null;
   await saveSession(session);
 
   // Удалить экран оплаты перед отправкой чека (best-effort).
-  await deleteOldUi(chatId, uiMsgId);
+  await deleteOldUi(chatId, liveMsgId);
 
   let orderId: string | null = null;
   let orderNumber: number | null = null;
@@ -860,6 +925,7 @@ async function handlePay(
       car,
       landmark,
     });
+    // live_message_id уже null в сессии — чек не запоминается.
   } catch (err) {
     console.error("create_order_failed", {
       user_id: session.user_id,
@@ -874,11 +940,10 @@ async function handlePay(
         err: String(retErr),
       });
     }
-    // Восстановить сессию
     session.state = "checkout_payment";
     session.cart = snapshotCart;
     session.context = { car, landmark };
-    session.ui_message_id = null;
+    session.live_message_id = null;
     try {
       await saveSession(session);
     } catch (saveErr) {
@@ -894,7 +959,7 @@ async function handlePay(
 }
 
 // ============================================================================
-// Утилита: безопасный вызов sendError
+// Утилиты
 // ============================================================================
 
 async function safeError(chatId: number): Promise<void> {
@@ -904,10 +969,6 @@ async function safeError(chatId: number): Promise<void> {
     console.error("send_error_failed", { chat_id: chatId, err: String(err) });
   }
 }
-
-// ============================================================================
-// Мелкие функции для sendSoftHint (вызывается из handleMessage напрямую)
-// ============================================================================
 
 async function sendSoftHint(chatId: number): Promise<void> {
   try {

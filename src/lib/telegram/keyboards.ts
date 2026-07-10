@@ -7,7 +7,11 @@
  */
 
 import type { CartItem, MenuItemRow, OrderStatus } from "@/types/database";
-import type { InlineKeyboardButton, InlineKeyboardMarkup } from "@/lib/telegram/api";
+import type {
+  InlineKeyboardButton,
+  InlineKeyboardMarkup,
+  ReplyKeyboardMarkup,
+} from "@/lib/telegram/api";
 
 // ============================================================================
 // Приветствие / главное меню
@@ -99,27 +103,75 @@ export function variantKeyboard(
 }
 
 // ============================================================================
+// Нижние панели (ReplyKeyboard)
+// ============================================================================
+
+/** Постоянная панель клиента. Шлётся один раз при /start. */
+export function clientReplyKeyboard(): ReplyKeyboardMarkup {
+  return {
+    keyboard: [
+      [{ text: "🧋 Меню" }, { text: "🛒 Корзина" }],
+      [{ text: "👀 Хочется попробовать" }, { text: "ℹ️ О нас" }],
+    ],
+    resize_keyboard: true,
+    is_persistent: true,
+  };
+}
+
+/** Постоянная панель админа. Шлётся при /init и после старта смены. */
+export function adminReplyKeyboard(): ReplyKeyboardMarkup {
+  return {
+    keyboard: [
+      [{ text: "📊 Статистика" }, { text: "📦 Остатки" }],
+      [{ text: "🔄 Новая смена" }],
+    ],
+    resize_keyboard: true,
+    is_persistent: true,
+  };
+}
+
+// ============================================================================
 // Корзина
 // ============================================================================
 
-export function cartKeyboard(cart: CartItem[]): InlineKeyboardMarkup {
+/**
+ * Клавиатура корзины. Строки: [−][N][+], где N — номер позиции (noop).
+ * Центральная кнопка не несёт данных — нужна как визуальный разделитель.
+ * confirmClear=true: кнопка «Очистить» становится «⚠️ Точно очистить?».
+ */
+export function cartKeyboard(
+  cart: CartItem[],
+  confirmClear = false
+): InlineKeyboardMarkup {
   const rows: InlineKeyboardButton[][] = [];
 
-  cart.forEach((item, idx) => {
-    const label = item.variant
-      ? `${item.title} (${item.variant.toLowerCase()}) ×${item.qty}`
-      : `${item.title} ×${item.qty}`;
+  cart.forEach((_item, idx) => {
     rows.push([
       { text: "−", callback_data: `dec:${idx}` },
-      { text: label, callback_data: "cart" },
+      { text: String(idx + 1), callback_data: "noop" },
       { text: "+", callback_data: `inc:${idx}` },
-      { text: "✖", callback_data: `del:${idx}` },
     ]);
   });
 
   rows.push([{ text: "✅ Оформить", callback_data: "checkout" }]);
-  rows.push([{ text: "➕ Добавить ещё", callback_data: "menu" }]);
+  const clearBtn = confirmClear
+    ? { text: "⚠️ Точно очистить?", callback_data: "cart_clear_go" }
+    : { text: "🗑 Очистить", callback_data: "cart_clear" };
+  rows.push([{ text: "➕ Добавить ещё", callback_data: "menu" }, clearBtn]);
 
+  return { inline_keyboard: rows };
+}
+
+// ============================================================================
+// Экран «Хочется попробовать»
+// ============================================================================
+
+export function wantListKeyboard(items: MenuItemRow[]): InlineKeyboardMarkup {
+  const rows: InlineKeyboardButton[][] = items.map((item) => {
+    const suffix = item.available && item.stock === 0 ? " (кончилось)" : "";
+    return [{ text: `${item.title}${suffix}`, callback_data: `want:${item.slug}` }];
+  });
+  rows.push([{ text: "⬅️ Меню", callback_data: "menu" }]);
   return { inline_keyboard: rows };
 }
 
@@ -246,22 +298,21 @@ export function demandAllKeyboard(): InlineKeyboardMarkup {
 }
 
 /**
- * Редактор остатков: одна строка на полевую позицию.
- * [−] [Айс-латте · 5 ✅] [+]
- * Центральная кнопка — toggle доступности (adm_stock:<slug>:toggle).
+ * Редактор остатков: [−][N ✅/⛔][+] на каждую позицию.
+ * Центральная кнопка (номер + статус) — toggle доступности.
+ * Полный текст с названиями и остатками — в тексте сообщения.
  */
 export function stockKeyboard(items: MenuItemRow[]): InlineKeyboardMarkup {
   const rows: InlineKeyboardButton[][] = [];
 
-  for (const item of items) {
+  items.forEach((item, idx) => {
     const status = item.available ? "✅" : "⛔";
-    const label = `${item.title} · ${item.stock} ${status}`;
     rows.push([
       { text: "−", callback_data: `adm_stock:${item.slug}:dec` },
-      { text: label, callback_data: `adm_stock:${item.slug}:toggle` },
+      { text: `${idx + 1} ${status}`, callback_data: `adm_stock:${item.slug}:toggle` },
       { text: "+", callback_data: `adm_stock:${item.slug}:inc` },
     ]);
-  }
+  });
 
   rows.push([{ text: "⬅️ Назад", callback_data: "adm_panel:home" }]);
   return { inline_keyboard: rows };
